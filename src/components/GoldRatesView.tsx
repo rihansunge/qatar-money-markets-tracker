@@ -16,6 +16,7 @@ import {
   calculateSpotGoldQarPerGram,
   formatQarRate,
 } from '../utils/goldMath';
+import { applyLiveTickToBars } from '../utils/chartSeries';
 import { HistoricalChart } from './HistoricalChart';
 
 interface GoldRatesViewProps {
@@ -89,14 +90,74 @@ export const GoldRatesView: React.FC<GoldRatesViewProps> = ({ liveFeedEnabled })
     fetchGoldHistory(timeframe);
   }, [timeframe, fetchGoldHistory]);
 
-  // Poll live XE.com + Malabar rates every 20s when Live Feed is enabled
+  // Connect real-time Gold SSE stream (/api/gold/stream) + periodic intraday bar refresh
   useEffect(() => {
     if (!liveFeedEnabled) return;
-    const id = window.setInterval(() => {
-      fetchLiveGold(false);
-    }, 20_000);
-    return () => window.clearInterval(id);
-  }, [liveFeedEnabled, fetchLiveGold]);
+    let cancelled = false;
+    let es: EventSource | null = null;
+    let fallbackPollId: number | null = null;
+
+    if (typeof EventSource !== 'undefined') {
+      es = new EventSource('/api/gold/stream');
+      es.addEventListener('tick', (evt) => {
+        if (cancelled) return;
+        try {
+          const data = JSON.parse((evt as MessageEvent<string>).data) as GoldRatesSnapshot;
+          if (data && Number.isFinite(data.xauUsd) && data.xauUsd > 0) {
+            setSnapshot(data);
+            setSnapshotError(null);
+            setLoadingSnapshot(false);
+          }
+        } catch {
+          // Ignore malformed SSE frame
+        }
+      });
+      es.addEventListener('heartbeat', (evt) => {
+        if (cancelled) return;
+        try {
+          const info = JSON.parse((evt as MessageEvent<string>).data) as { fetchedAt?: string };
+          if (info.fetchedAt) {
+            setSnapshot((prev) => (prev ? { ...prev, fetchedAt: info.fetchedAt! } : prev));
+          }
+        } catch {
+          // Ignore malformed heartbeat
+        }
+      });
+    } else {
+      fallbackPollId = window.setInterval(() => {
+        fetchLiveGold(false);
+      }, 4_000);
+    }
+
+    const isIntraday =
+      timeframe === '5m' ||
+      timeframe === '15m' ||
+      timeframe === '1H' ||
+      timeframe === '1D' ||
+      timeframe === '1W';
+    const historyRefreshId = window.setInterval(() => {
+      fetchGoldHistory(timeframe);
+    }, isIntraday ? 15_000 : 45_000);
+
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+      if (fallbackPollId) window.clearInterval(fallbackPollId);
+      window.clearInterval(historyRefreshId);
+    };
+  }, [liveFeedEnabled, timeframe, fetchLiveGold, fetchGoldHistory]);
+
+  // Keep XAU/USD TradingView chart bars anchored to every live SSE rate tick
+  const liveBars = useMemo(() => {
+    if (!snapshot || !Number.isFinite(snapshot.xauUsd) || snapshot.xauUsd <= 0) {
+      return bars;
+    }
+    return applyLiveTickToBars(bars, {
+      timeframe,
+      livePrice: snapshot.xauUsd,
+      precision: 2,
+    });
+  }, [bars, timeframe, snapshot]);
 
   const activeKaratSpreads = useMemo(() => {
     if (spreadMode === 'malabar-karat') {
@@ -332,13 +393,15 @@ export const GoldRatesView: React.FC<GoldRatesViewProps> = ({ liveFeedEnabled })
         ) : (
           <HistoricalChart
             title="Gold Ounce to US Dollar (XAU/USD)"
-            subtitle="Anchored to live XE.com XAU/USD mid-market spot · Candlesticks, 45 DMA, 200 DMA & Fibonacci"
-            bars={bars}
+            subtitle="Live XAU/USD mid-market spot linked to XE.com · Candlesticks, 45 DMA, 200 DMA & Fibonacci"
+            bars={liveBars}
             timeframe={timeframe}
             onTimeframeChange={setTimeframe}
             unitLabel="USD/oz"
             benchmarkLabel="QSE Benchmark"
             height={340}
+            isLive={liveFeedEnabled}
+            lastUpdatedAt={snapshot?.fetchedAt}
           />
         )}
       </div>

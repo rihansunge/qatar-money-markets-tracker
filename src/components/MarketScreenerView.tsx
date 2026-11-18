@@ -16,6 +16,8 @@ interface MarketScreenerViewProps {
   onOpenNewAlert: (ticker: string) => void;
   onOpenAddHolding: (ticker: string) => void;
   benchmarkValue: number;
+  liveFeedEnabled: boolean;
+  lastLiveSyncAt: string | null;
   priceFlashes?: Record<string, 'up' | 'down'>;
 }
 
@@ -32,6 +34,8 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   onOpenNewAlert,
   onOpenAddHolding,
   benchmarkValue,
+  liveFeedEnabled,
+  lastLiveSyncAt,
   priceFlashes = {},
 }) => {
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
@@ -84,6 +88,11 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     timeframe,
     activeSecurity.price,
     benchmarkValue,
+    {
+      liveFeedEnabled,
+      liveDayVolume: activeSecurity.volume,
+      precision: 3,
+    },
   );
 
   const handleSort = (field: SortField) => {
@@ -123,6 +132,8 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
             onTimeframeChange={setTimeframe}
             unitLabel="QAR"
             height={280}
+            isLive={liveFeedEnabled}
+            lastUpdatedAt={lastLiveSyncAt}
           />
         </div>
 

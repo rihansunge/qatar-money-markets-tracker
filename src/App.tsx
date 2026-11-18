@@ -525,6 +525,8 @@ export default function App() {
               portfolio={portfolioAnalytics}
               marketSentiment={marketSentiment}
               watchlistTickers={watchlistTickers}
+              liveFeedEnabled={liveFeedEnabled}
+              lastLiveSyncAt={lastLiveSyncAt}
               onNavigate={setActiveSection}
               onSelectTicker={setSelectedTicker}
               onOpenNewAlert={(t) => {
@@ -551,6 +553,8 @@ export default function App() {
                 setPositionModalOpen(true);
               }}
               benchmarkValue={indices[0].value}
+              liveFeedEnabled={liveFeedEnabled}
+              lastLiveSyncAt={lastLiveSyncAt}
               priceFlashes={priceFlashes}
             />
           )}

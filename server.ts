@@ -1109,16 +1109,30 @@ async function startServer() {
         return res.status(404).json({ error: `No historical bars found for ${rawTicker}` });
       }
 
-      // If index, scale proxy ETF bars to the live index value
+      // Anchor final bar to official real-time QSE feed (stocks and indices)
       let scale = 1;
+      let liveQuotePrice: number | null = null;
+      let liveQuoteHigh: number | null = null;
+      let liveQuoteLow: number | null = null;
+      const liveSnapshot = await fetchLiveQseSnapshot(false).catch(() => null);
+
       if (isIndex) {
-        const live = (await fetchLiveQseSnapshot()) as { indices?: LiveIndexPatch[] };
-        const liveIdx = live.indices?.find((i) => i.symbol === rawTicker);
+        const liveIdx = liveSnapshot?.indices?.find((i) => i.symbol === rawTicker);
         const lastBarClose = assetChart.bars[assetChart.bars.length - 1].close || 1;
         if (liveIdx) {
           scale = liveIdx.value / lastBarClose;
+          liveQuotePrice = liveIdx.value;
+          liveQuoteHigh = liveIdx.dayHigh;
+          liveQuoteLow = liveIdx.dayLow;
         } else {
           scale = rawTicker === 'QSI' ? 1014 : rawTicker === 'QERI' ? 2390 : 404;
+        }
+      } else {
+        const liveQuote = liveSnapshot?.quotes?.[rawTicker];
+        if (liveQuote && liveQuote.price > 0) {
+          liveQuotePrice = liveQuote.price;
+          liveQuoteHigh = liveQuote.dayHigh;
+          liveQuoteLow = liveQuote.dayLow;
         }
       }
 
@@ -1145,7 +1159,22 @@ async function startServer() {
         };
       });
 
-      historyCache.set(cacheKey, { expiresAt: Date.now() + 60_000, bars });
+      if (bars.length > 0 && liveQuotePrice !== null && liveQuotePrice > 0) {
+        const last = bars[bars.length - 1];
+        const isDailyBar = tf === '1M' || tf === '3M' || tf === '1Y';
+        last.close = roundTo(liveQuotePrice, precision);
+        last.high = roundTo(
+          Math.max(last.high, liveQuotePrice, isDailyBar && liveQuoteHigh ? liveQuoteHigh : last.high),
+          precision,
+        );
+        last.low = roundTo(
+          Math.min(last.low, liveQuotePrice, isDailyBar && liveQuoteLow ? liveQuoteLow : last.low),
+          precision,
+        );
+      }
+
+      const isIntradayTf = tf === '5M' || tf === '15M' || tf === '1H' || tf === '1D' || tf === '1W';
+      historyCache.set(cacheKey, { expiresAt: Date.now() + (isIntradayTf ? 10_000 : 30_000), bars });
       return res.json({ source: 'live', ticker: rawTicker, timeframe: tf, bars });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fetch history';
@@ -1154,14 +1183,42 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
-  // Live Gold Rates (XE.com XAU/USD + USD/QAR + Malabar Gold Qatar 24K/22K/18K)
+  // Live Gold Rates (XE.com + Real-Time XAU/USD + USD/QAR + Malabar Gold Qatar)
   // ---------------------------------------------------------------------------
   let goldLiveCache: { expiresAt: number; payload: GoldRatesSnapshot } | null = null;
+  let xeRatesCache: {
+    expiresAt: number;
+    xauUsd: number | null;
+    usdQar: number | null;
+    timestampMs: number;
+  } | null = null;
+  let malabarCache: {
+    expiresAt: number;
+    data: {
+      rates: { '24K': number; '22K': number; '18K': number; '21K'?: number } | null;
+      usdPerGram: { '24K': number; '22K': number; '18K': number } | null;
+      updatedText: string;
+      sourceLabel: string;
+    };
+  } | null = null;
   const goldHistoryCache = new Map<string, { expiresAt: number; bars: OhlcBar[] }>();
 
-  async function fetchXeRate(from: string, to: string): Promise<number | null> {
+  async function fetchXeMidMarketSnapshot(forceRefresh = false): Promise<{
+    xauUsd: number | null;
+    usdQar: number | null;
+    timestampMs: number;
+  }> {
+    const now = Date.now();
+    if (!forceRefresh && xeRatesCache && xeRatesCache.expiresAt > now) {
+      return {
+        xauUsd: xeRatesCache.xauUsd,
+        usdQar: xeRatesCache.usdQar,
+        timestampMs: xeRatesCache.timestampMs,
+      };
+    }
+
     try {
-      const url = `https://www.xe.com/currencyconverter/convert/?Amount=1&From=${encodeURIComponent(from)}&To=${encodeURIComponent(to)}`;
+      const url = 'https://www.xe.com/currencyconverter/convert/?Amount=1&From=XAU&To=USD';
       const r = await fetch(url, {
         headers: {
           'User-Agent':
@@ -1170,27 +1227,120 @@ async function startServer() {
         },
         signal: AbortSignal.timeout(7000),
       });
-      if (!r.ok) return null;
-      const html = await r.text();
-      const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-      const re = new RegExp(`1\\s*${from}\\s*=\\s*([\\d,]+(?:\\.\\d+)?)\\s*${to}`, 'i');
-      const m = re.exec(text);
-      if (m) {
-        const val = Number(m[1].replace(/,/g, ''));
-        if (Number.isFinite(val) && val > 0) return val;
+      if (r.ok) {
+        const html = await r.text();
+        let xauUsd: number | null = null;
+        let usdQar: number | null = null;
+        let timestampMs = 0;
+
+        const nextMatch = /__NEXT_DATA__[^>]*>([^<]+)</.exec(html);
+        if (nextMatch) {
+          try {
+            const parsed = JSON.parse(nextMatch[1]) as {
+              props?: {
+                pageProps?: {
+                  initialRatesData?: { timestamp?: number; rates?: Record<string, number> };
+                };
+              };
+            };
+            const ratesData = parsed?.props?.pageProps?.initialRatesData;
+            const rates = ratesData?.rates;
+            if (typeof ratesData?.timestamp === 'number') {
+              timestampMs = ratesData.timestamp;
+            }
+            if (rates && typeof rates.XAU === 'number' && rates.XAU > 0) {
+              xauUsd = 1 / rates.XAU;
+            }
+            if (rates && typeof rates.QAR === 'number' && rates.QAR > 0) {
+              usdQar = rates.QAR;
+            }
+          } catch {
+            // Fall back to visible text extraction below
+          }
+        }
+
+        if (!xauUsd) {
+          const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+          const m = /1\s*XAU\s*=\s*([\d,]+(?:\.\d+)?)\s*USD/i.exec(text);
+          if (m) {
+            const val = Number(m[1].replace(/,/g, ''));
+            if (Number.isFinite(val) && val > 0) xauUsd = val;
+          }
+        }
+
+        xeRatesCache = {
+          expiresAt: now + 15_000,
+          xauUsd,
+          usdQar,
+          timestampMs,
+        };
+        return { xauUsd, usdQar, timestampMs };
       }
-      return null;
+    } catch {
+      // Keep last cached XE rate if request fails
+    }
+
+    return {
+      xauUsd: xeRatesCache?.xauUsd ?? null,
+      usdQar: xeRatesCache?.usdQar ?? null,
+      timestampMs: xeRatesCache?.timestampMs ?? 0,
+    };
+  }
+
+  async function fetchRealtimeSpotXauUsd(): Promise<{
+    price: number;
+    previousClose: number;
+    source: string;
+  } | null> {
+    try {
+      const res = await fetch('https://scanner.tradingview.com/global/scan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; QatarMoneyMarkets/1.0)',
+        },
+        body: JSON.stringify({
+          symbols: { tickers: ['FX_IDC:XAUUSD', 'OANDA:XAUUSD', 'TVC:GOLD'] },
+          columns: ['name', 'close', 'change_abs'],
+        }),
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as {
+        data?: Array<{ s: string; d: Array<string | number | null> }>;
+      };
+      const row =
+        json.data?.find((d) => d.s === 'FX_IDC:XAUUSD' && Number(d.d?.[1]) > 0) ??
+        json.data?.find((d) => d.s === 'OANDA:XAUUSD' && Number(d.d?.[1]) > 0) ??
+        json.data?.find((d) => Number(d.d?.[1]) > 0);
+      if (!row) return null;
+      const close = Number(row.d[1]);
+      const changeAbs = Number(row.d[2] ?? 0);
+      if (!Number.isFinite(close) || close <= 0) return null;
+      return {
+        price: close,
+        previousClose: Number.isFinite(changeAbs) ? close - changeAbs : close,
+        source: 'Live XAU/USD Spot Feed (XE.com Linked)',
+      };
     } catch {
       return null;
     }
   }
 
-  async function fetchMalabarQatarRates(usdQar: number): Promise<{
+  async function fetchMalabarQatarRates(
+    usdQar: number,
+    forceRefresh = false,
+  ): Promise<{
     rates: { '24K': number; '22K': number; '18K': number; '21K'?: number } | null;
     usdPerGram: { '24K': number; '22K': number; '18K': number } | null;
     updatedText: string;
     sourceLabel: string;
   }> {
+    const now = Date.now();
+    if (!forceRefresh && malabarCache && malabarCache.expiresAt > now && malabarCache.data.rates) {
+      return malabarCache.data;
+    }
+
     // Primary: Official Malabar Gold & Diamonds live currentGoldRate endpoint
     try {
       const r = await fetch(
@@ -1222,7 +1372,7 @@ async function startServer() {
           const updatedStr = [dtMatch?.[1]?.trim(), tmMatch?.[1]?.trim()]
             .filter(Boolean)
             .join(' · ');
-          return {
+          const result = {
             rates: qarRates,
             usdPerGram: {
               '24K': roundTo(usd24, 2),
@@ -1232,6 +1382,8 @@ async function startServer() {
             updatedText: updatedStr ? `Malabar Official (${updatedStr})` : 'Malabar Official Live Board',
             sourceLabel: 'Malabar Gold & Diamonds Official Feed (Qatar Retail Board)',
           };
+          malabarCache = { expiresAt: now + 30_000, data: result };
+          return result;
         }
       }
     } catch {
@@ -1261,7 +1413,7 @@ async function startServer() {
           const usd22 = Number(m[2].replace(/,/g, '')) / 3.6725;
           const usd18 = Number(m[3].replace(/,/g, '')) / 3.6725;
           if (usd24 > 0 && usd22 > 0 && usd18 > 0) {
-            return {
+            const result = {
               rates: convertMalabarUsdToQatarBoard({ usd24, usd22, usd18, usdQar }),
               usdPerGram: {
                 '24K': roundTo(usd24, 2),
@@ -1271,6 +1423,8 @@ async function startServer() {
               updatedText: 'GCC Retail Board Fallback',
               sourceLabel: 'GCC Retail Jewellery Board (dubaicityofgold.com)',
             };
+            malabarCache = { expiresAt: now + 30_000, data: result };
+            return result;
           }
         }
       }
@@ -1278,12 +1432,14 @@ async function startServer() {
       // Return null if both live feeds fail
     }
 
-    return {
-      rates: null,
-      usdPerGram: null,
-      updatedText: 'Malabar counter feed temporarily unavailable',
-      sourceLabel: 'Malabar Gold & Diamonds (unavailable)',
-    };
+    return (
+      malabarCache?.data ?? {
+        rates: null,
+        usdPerGram: null,
+        updatedText: 'Malabar counter feed temporarily unavailable',
+        sourceLabel: 'Malabar Gold & Diamonds (unavailable)',
+      }
+    );
   }
 
   async function fetchLiveGoldSnapshot(forceRefresh = false): Promise<GoldRatesSnapshot> {
@@ -1292,32 +1448,55 @@ async function startServer() {
       return goldLiveCache.payload;
     }
 
-    const [xeXauUsd, xeUsdQar, gcChart] = await Promise.all([
-      fetchXeRate('XAU', 'USD'),
-      fetchXeRate('USD', 'QAR'),
-      fetchYahooChart('GC=F', '1d', '5d').catch(() => null),
+    const [xeMid, realtimeSpot, gcChart] = await Promise.all([
+      fetchXeMidMarketSnapshot(forceRefresh),
+      fetchRealtimeSpotXauUsd(),
+      fetchYahooChart('GC=F', '1m', '1d').catch(() => null),
     ]);
 
-    const usdQar = xeUsdQar ?? 3.64;
-    const malabar = await fetchMalabarQatarRates(usdQar);
+    const usdQar = xeMid.usdQar ?? 3.64;
+    const malabar = await fetchMalabarQatarRates(usdQar, forceRefresh);
 
     const gcBars = gcChart?.bars ?? [];
     const gcLatest = Number(gcChart?.meta?.regularMarketPrice ?? gcBars[gcBars.length - 1]?.close ?? 0);
     const gcPrev = Number(
       gcChart?.meta?.chartPreviousClose ??
         gcChart?.meta?.previousClose ??
-        (gcBars.length >= 2 ? gcBars[gcBars.length - 2].close : gcLatest),
+        (gcBars.length >= 2 ? gcBars[0].open : gcLatest),
     );
 
-    const xauUsd = xeXauUsd ?? (gcLatest > 0 ? gcLatest : 0);
+    const xeIsFresh =
+      Boolean(xeMid.xauUsd && xeMid.xauUsd > 0) &&
+      xeMid.timestampMs > 0 &&
+      now - xeMid.timestampMs <= 90_000;
+
+    let xauUsd = 0;
+    let previousXauUsd = 0;
+    let xauUsdSource = '';
+
+    if (xeIsFresh && xeMid.xauUsd) {
+      xauUsd = xeMid.xauUsd;
+      previousXauUsd = realtimeSpot?.previousClose ?? (gcPrev > 0 ? gcPrev : xauUsd);
+      xauUsdSource = 'XE.com Live Mid-Market Rate (XAU/USD)';
+    } else if (realtimeSpot && realtimeSpot.price > 0) {
+      xauUsd = realtimeSpot.price;
+      previousXauUsd = realtimeSpot.previousClose > 0 ? realtimeSpot.previousClose : xauUsd;
+      xauUsdSource = realtimeSpot.source;
+    } else if (xeMid.xauUsd && xeMid.xauUsd > 0) {
+      xauUsd = xeMid.xauUsd;
+      previousXauUsd = gcPrev > 0 ? gcPrev : xauUsd;
+      xauUsdSource = 'XE.com Mid-Market Rate (XAU/USD)';
+    } else if (gcLatest > 0) {
+      xauUsd = gcLatest;
+      previousXauUsd = gcPrev > 0 ? gcPrev : gcLatest;
+      xauUsdSource = 'COMEX Gold Futures Live (GC=F)';
+    }
+
     if (xauUsd <= 0) {
       throw new Error('Unable to fetch live XAU/USD gold rate from XE.com or fallback market feed');
     }
 
-    const xauUsdSource = xeXauUsd
-      ? 'XE.com Live Mid-Market Rate (XAU/USD)'
-      : 'COMEX Gold Futures Fallback (GC=F)';
-    const usdQarSource = xeUsdQar ? 'XE.com Live Rate (USD/QAR)' : 'QCB Official Peg (3.64 QAR)';
+    const usdQarSource = xeMid.usdQar ? 'XE.com Live Rate (USD/QAR)' : 'QCB Official Peg (3.64 QAR)';
 
     const calibratedKaratSpreadsPct = computeObservedMalabarKaratSpreadsPct(
       xauUsd,
@@ -1334,7 +1513,7 @@ async function startServer() {
     const payload: GoldRatesSnapshot = {
       fetchedAt: new Date().toISOString(),
       xauUsd: roundTo(xauUsd, 2),
-      previousXauUsd: roundTo(gcPrev > 0 ? gcPrev : xauUsd, 2),
+      previousXauUsd: roundTo(previousXauUsd > 0 ? previousXauUsd : xauUsd, 2),
       xauUsdSource,
       usdQar: roundTo(usdQar, 4),
       usdQarSource,
@@ -1352,9 +1531,78 @@ async function startServer() {
       calibratedKaratSpreadsPct,
     };
 
-    goldLiveCache = { expiresAt: now + 20_000, payload };
+    goldLiveCache = { expiresAt: now + 1_500, payload };
     return payload;
   }
+
+  function getGoldSignature(s: GoldRatesSnapshot): string {
+    const r = s.malabarRatesQarPerGram;
+    return `${s.xauUsd}|${s.usdQar}|${r?.['24K'] ?? ''}|${r?.['22K'] ?? ''}|${r?.['18K'] ?? ''}`;
+  }
+
+  const goldSseClients = new Set<express.Response>();
+  let goldStreamTimer: ReturnType<typeof setInterval> | null = null;
+  let lastGoldBroadcastSig = '';
+  let goldStreamInFlight = false;
+
+  const startGoldStreamLoop = () => {
+    if (goldStreamTimer) return;
+    goldStreamTimer = setInterval(async () => {
+      if (goldSseClients.size === 0 || goldStreamInFlight) return;
+      goldStreamInFlight = true;
+      try {
+        const snapshot = await fetchLiveGoldSnapshot(false);
+        const sig = getGoldSignature(snapshot);
+        if (sig !== lastGoldBroadcastSig) {
+          lastGoldBroadcastSig = sig;
+          const frame = `event: tick\ndata: ${JSON.stringify(snapshot)}\n\n`;
+          for (const client of goldSseClients) {
+            client.write(frame);
+          }
+        } else {
+          const heartbeat = `event: heartbeat\ndata: ${JSON.stringify({ fetchedAt: snapshot.fetchedAt })}\n\n`;
+          for (const client of goldSseClients) {
+            client.write(heartbeat);
+          }
+        }
+      } catch {
+        // Keep gold SSE stream alive across transient upstream hiccups
+      } finally {
+        goldStreamInFlight = false;
+      }
+    }, 2_500);
+  };
+
+  const stopGoldStreamLoopIfIdle = () => {
+    if (goldSseClients.size === 0 && goldStreamTimer) {
+      clearInterval(goldStreamTimer);
+      goldStreamTimer = null;
+    }
+  };
+
+  app.get('/api/gold/stream', async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    goldSseClients.add(res);
+    startGoldStreamLoop();
+
+    try {
+      const initial = await fetchLiveGoldSnapshot(false);
+      lastGoldBroadcastSig = getGoldSignature(initial);
+      res.write(`event: tick\ndata: ${JSON.stringify(initial)}\n\n`);
+    } catch {
+      res.write(`event: heartbeat\ndata: ${JSON.stringify({ fetchedAt: new Date().toISOString() })}\n\n`);
+    }
+
+    req.on('close', () => {
+      goldSseClients.delete(res);
+      stopGoldStreamLoopIfIdle();
+    });
+  });
 
   app.get('/api/gold/live', async (req, res) => {
     try {
@@ -1370,6 +1618,7 @@ async function startServer() {
   app.get('/api/gold/history', async (req, res) => {
     const tf = String(req.query.tf || '1M').toUpperCase();
     const cfg = TIMEFRAME_MAP[tf] ?? TIMEFRAME_MAP['1M'];
+    const isIntradayTf = tf === '5M' || tf === '15M' || tf === '1H' || tf === '1D' || tf === '1W';
     const cached = goldHistoryCache.get(tf);
     if (cached && cached.expiresAt > Date.now()) {
       return res.json({ source: 'xe-anchored', symbol: 'XAU/USD', timeframe: tf, bars: cached.bars });
@@ -1405,7 +1654,14 @@ async function startServer() {
         };
       });
 
-      goldHistoryCache.set(tf, { expiresAt: Date.now() + 30_000, bars });
+      if (bars.length > 0 && liveSnapshot && liveSnapshot.xauUsd > 0) {
+        const last = bars[bars.length - 1];
+        last.close = roundTo(liveSnapshot.xauUsd, 2);
+        last.high = roundTo(Math.max(last.high, last.close), 2);
+        last.low = roundTo(Math.min(last.low, last.close), 2);
+      }
+
+      goldHistoryCache.set(tf, { expiresAt: Date.now() + (isIntradayTf ? 10_000 : 20_000), bars });
       return res.json({ source: 'xe-anchored', symbol: 'XAU/USD', timeframe: tf, bars });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fetch gold chart history';

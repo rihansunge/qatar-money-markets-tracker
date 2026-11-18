@@ -35,6 +35,8 @@ interface HistoricalChartProps {
   unitLabel?: string;
   benchmarkLabel?: string;
   height?: number;
+  isLive?: boolean;
+  lastUpdatedAt?: string | null;
 }
 
 const TIMEFRAMES: Timeframe[] = ['5m', '15m', '1H', '1D', '1W', '1M', '3M', '1Y', '3Y', '5Y'];
@@ -48,6 +50,8 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
   unitLabel = 'QAR',
   benchmarkLabel = 'QE Index (QSI)',
   height = 360,
+  isLive,
+  lastUpdatedAt,
 }) => {
   const [chartMode, setChartMode] = useState<'candles' | 'area'>('candles');
   const [indicatorsOpen, setIndicatorsOpen] = useState(false);
@@ -65,6 +69,7 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
   const [fibPickMode, setFibPickMode] = useState<'idle' | 'pick-first' | 'pick-second'>('idle');
   const [customFibRange, setCustomFibRange] = useState<{ p1: number; p2: number } | null>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [priceFlash, setPriceFlash] = useState<'up' | 'down' | null>(null);
   const [isDarkTheme, setIsDarkTheme] = useState<boolean>(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
   );
@@ -84,6 +89,15 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
   const benchRef = useRef<ISeriesApi<'Line'> | null>(null);
   const fibLinesRef = useRef<IPriceLine[]>([]);
   const lastFitSigRef = useRef<string>('');
+  const lastSeriesMetaRef = useRef<{
+    baseSig: string;
+    overlaysSig: string;
+    len: number;
+    firstTime: number;
+    lastTime: number;
+  } | null>(null);
+  const prevCloseTrackerRef = useRef<{ sig: string; close: number } | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
   const fibPickModeRef = useRef<'idle' | 'pick-first' | 'pick-second'>('idle');
   const firstPickedPriceRef = useRef<number | null>(null);
 
@@ -432,6 +446,7 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
     bbLowerRef.current = bbLowerSeries;
     benchRef.current = benchSeries;
     lastFitSigRef.current = '';
+    lastSeriesMetaRef.current = null;
 
     return () => {
       resizeObserver.disconnect();
@@ -450,6 +465,7 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
       bbLowerRef.current = null;
       benchRef.current = null;
       fibLinesRef.current = [];
+      lastSeriesMetaRef.current = null;
     };
   }, [chartMode, height]);
 
@@ -482,17 +498,93 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
     });
   }, [isDarkTheme, timeframe]);
 
-  // Push series data & technical studies
+  // Push series data & technical studies (uses incremental .update() on live ticks to prevent flicker)
   useEffect(() => {
     const mainSeries = mainSeriesRef.current;
     const volSeries = volSeriesRef.current;
     const chart = chartRef.current;
     if (!mainSeries || !volSeries || !chart || normalized.length === 0) return;
 
+    const baseSig = `${title}|${timeframe}|${chartMode}|${unitLabel}`;
+    const overlaysSig = `${showDma45}|${showDma200}|${showSma20}|${showSma50}|${showEma20}|${showBollinger}|${Boolean(
+      normalizedBench,
+    )}`;
+    const firstTime = Number(normalized[0].time);
+    const lastIdx = normalized.length - 1;
+    const lastPt = normalized[lastIdx];
+    const lastTime = Number(lastPt.time);
+    const prevMeta = lastSeriesMetaRef.current;
+
+    const canIncrementalUpdate =
+      prevMeta !== null &&
+      prevMeta.baseSig === baseSig &&
+      prevMeta.overlaysSig === overlaysSig &&
+      prevMeta.firstTime === firstTime &&
+      ((normalized.length === prevMeta.len && lastTime === prevMeta.lastTime) ||
+        (normalized.length === prevMeta.len + 1 && lastTime > prevMeta.lastTime));
+
+    if (canIncrementalUpdate) {
+      if (chartMode === 'candles') {
+        (mainSeries as ISeriesApi<'Candlestick'>).update({
+          time: lastPt.time,
+          open: lastPt.bar.open,
+          high: lastPt.bar.high,
+          low: lastPt.bar.low,
+          close: lastPt.bar.close,
+        });
+      } else {
+        (mainSeries as ISeriesApi<'Area'>).update({
+          time: lastPt.time,
+          value: lastPt.bar.close,
+        });
+      }
+
+      volSeries.update({
+        time: lastPt.time,
+        value: lastPt.bar.volume,
+        color:
+          lastPt.bar.close >= lastPt.bar.open
+            ? 'rgba(8, 153, 129, 0.32)'
+            : 'rgba(242, 54, 69, 0.32)',
+      });
+
+      if (showDma45 && dma45Values[lastIdx] !== null) {
+        dma45Ref.current?.update({ time: lastPt.time, value: dma45Values[lastIdx]! });
+      }
+      if (showDma200 && dma200Values[lastIdx] !== null) {
+        dma200Ref.current?.update({ time: lastPt.time, value: dma200Values[lastIdx]! });
+      }
+      if (showSma20 && sma20[lastIdx] !== null) {
+        sma20Ref.current?.update({ time: lastPt.time, value: sma20[lastIdx]! });
+      }
+      if (showSma50 && sma50[lastIdx] !== null) {
+        sma50Ref.current?.update({ time: lastPt.time, value: sma50[lastIdx]! });
+      }
+      if (showEma20 && ema20[lastIdx] !== null) {
+        ema20Ref.current?.update({ time: lastPt.time, value: ema20[lastIdx]! });
+      }
+      if (showBollinger && bollinger[lastIdx]) {
+        bbUpperRef.current?.update({ time: lastPt.time, value: bollinger[lastIdx]!.upper });
+        bbLowerRef.current?.update({ time: lastPt.time, value: bollinger[lastIdx]!.lower });
+      }
+      if (normalizedBench && normalizedBench[lastIdx]) {
+        benchRef.current?.update(normalizedBench[lastIdx]);
+      }
+
+      lastSeriesMetaRef.current = {
+        baseSig,
+        overlaysSig,
+        len: normalized.length,
+        firstTime,
+        lastTime,
+      };
+      return;
+    }
+
     const isSub10 = unitLabel === 'QAR' && normalized[0].bar.close < 10;
     mainSeries.applyOptions({
       priceFormat: {
-        type: 'price',
+        type: 'price' as const,
         precision: isSub10 ? 3 : 2,
         minMove: isSub10 ? 0.001 : 0.01,
       },
@@ -583,8 +675,16 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
     );
     benchRef.current?.setData(normalizedBench ?? []);
 
-    // Fit content only when switching asset, timeframe, bar count, or mode (preserves zoom/pan on live ticks)
-    const fitSig = `${title}|${timeframe}|${chartMode}|${normalized.length}|${normalized[0].time}`;
+    lastSeriesMetaRef.current = {
+      baseSig,
+      overlaysSig,
+      len: normalized.length,
+      firstTime,
+      lastTime,
+    };
+
+    // Fit content only when switching asset, timeframe, or mode (preserves zoom/pan on live ticks)
+    const fitSig = `${title}|${timeframe}|${chartMode}|${firstTime}`;
     if (lastFitSigRef.current !== fitSig) {
       lastFitSigRef.current = fitSig;
       chart.timeScale().fitContent();
@@ -609,6 +709,25 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
     timeframe,
     unitLabel,
   ]);
+
+  // Flash headline rate subtly on live up/down ticks
+  const latestBarClose = normalized.length > 0 ? normalized[normalized.length - 1].bar.close : 0;
+  useEffect(() => {
+    const assetSig = `${title}|${timeframe}`;
+    const prev = prevCloseTrackerRef.current;
+    if (prev && prev.sig === assetSig && latestBarClose !== prev.close && latestBarClose > 0) {
+      setPriceFlash(latestBarClose > prev.close ? 'up' : 'down');
+      if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = window.setTimeout(() => setPriceFlash(null), 900);
+    }
+    prevCloseTrackerRef.current = { sig: assetSig, close: latestBarClose };
+  }, [title, timeframe, latestBarClose]);
+
+  useEffect(() => {
+    return () => {
+      if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    };
+  }, []);
 
   // Manage horizontal Fibonacci retracement price lines
   useEffect(() => {
@@ -794,14 +913,40 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
       {/* Header & Intraday / Daily / Multi-Year Timeframes */}
       <div className="flex flex-col gap-3 border-b border-slate-100 pb-4 lg:flex-row lg:items-start lg:justify-between dark:border-slate-800">
         <div>
-          <div className="flex flex-wrap items-baseline gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
+            {isLive !== undefined && (
+              <span
+                data-testid="chart-live-status"
+                className={`inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                  isLive
+                    ? 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:ring-emerald-800'
+                    : 'bg-slate-100 text-slate-500 ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:ring-slate-700'
+                }`}
+              >
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    isLive ? 'animate-pulse bg-emerald-500' : 'bg-slate-400'
+                  }`}
+                />
+                {isLive ? 'Live' : 'Paused'}
+              </span>
+            )}
             {subtitle && (
               <span className="text-xs text-slate-500 dark:text-slate-400">{subtitle}</span>
             )}
           </div>
           <div className="mt-1.5 flex flex-wrap items-baseline gap-4 font-mono tabular-nums">
-            <span className="text-2xl font-semibold text-slate-900 dark:text-slate-50">
+            <span
+              data-testid="chart-headline-price"
+              className={`rounded px-1 -mx-1 text-2xl font-semibold transition-colors duration-300 ${
+                priceFlash === 'up'
+                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+                  : priceFlash === 'down'
+                    ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-300'
+                    : 'text-slate-900 dark:text-slate-50'
+              }`}
+            >
               {formatNum(activeBar.close)}{' '}
               <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
                 {unitLabel}
@@ -821,6 +966,16 @@ export const HistoricalChart: React.FC<HistoricalChartProps> = ({
               ({periodChangePct >= 0 ? '+' : ''}
               {periodChangePct.toFixed(2)}%) · {timeframe}
             </span>
+            {lastUpdatedAt && (
+              <span className="text-[11px] font-sans text-slate-400 dark:text-slate-500">
+                Updated{' '}
+                {new Date(lastUpdatedAt).toLocaleTimeString('en-US', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                })}
+              </span>
+            )}
           </div>
         </div>
 

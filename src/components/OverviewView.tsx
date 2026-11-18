@@ -22,6 +22,8 @@ interface OverviewViewProps {
   portfolio: PortfolioAnalytics;
   marketSentiment: MarketSentimentSummary;
   watchlistTickers: string[];
+  liveFeedEnabled: boolean;
+  lastLiveSyncAt: string | null;
   onNavigate: (section: NavSection) => void;
   onSelectTicker: (ticker: string) => void;
   onOpenNewAlert: (ticker?: string) => void;
@@ -35,6 +37,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   portfolio,
   marketSentiment,
   watchlistTickers,
+  liveFeedEnabled,
+  lastLiveSyncAt,
   onNavigate,
   onSelectTicker,
   onOpenNewAlert,
@@ -50,6 +54,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
       return {
         ticker: 'QSI',
         fallbackPrice: qsi.value,
+        liveDayVolume: undefined as number | undefined,
+        precision: 2,
         title: 'QE Index (QSI)',
         subtitle: 'Qatar Stock Exchange Main Benchmark',
         unitLabel: 'PTS',
@@ -59,6 +65,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
       return {
         ticker: 'QERI',
         fallbackPrice: qeri.value,
+        liveDayVolume: undefined as number | undefined,
+        precision: 2,
         title: 'QE Al Rayan Islamic Index (QERI)',
         subtitle: 'Shariah-Compliant Benchmark',
         unitLabel: 'PTS',
@@ -68,6 +76,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     return {
       ticker: sec.ticker,
       fallbackPrice: sec.price,
+      liveDayVolume: sec.volume,
+      precision: 3,
       title: `${sec.ticker} · ${sec.name}`,
       subtitle: `${sec.sector}${sec.shariah.isCompliant ? ' · Shariah Compliant' : ''}`,
       unitLabel: 'QAR',
@@ -79,6 +89,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     timeframe,
     chartMeta.fallbackPrice,
     qsi.value,
+    {
+      liveFeedEnabled,
+      liveDayVolume: chartMeta.liveDayVolume,
+      precision: chartMeta.precision,
+    },
   );
 
   const chartConfig = {
@@ -162,6 +177,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             onTimeframeChange={setTimeframe}
             unitLabel={chartConfig.unitLabel}
             height={285}
+            isLive={liveFeedEnabled}
+            lastUpdatedAt={lastLiveSyncAt}
           />
         </div>
 

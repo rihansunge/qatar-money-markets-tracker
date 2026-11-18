@@ -1,13 +1,22 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { OhlcBar, Timeframe } from '../types/market';
 import { generateHistoricalSeries } from '../data/qseData';
+import { applyLiveTickToBars } from './chartSeries';
+
+export interface LiveHistoryOptions {
+  liveFeedEnabled?: boolean;
+  liveDayVolume?: number;
+  precision?: number;
+}
 
 export function useLiveHistory(
   ticker: string,
   timeframe: Timeframe,
   fallbackPrice: number,
   benchmarkValue: number,
+  options: LiveHistoryOptions = {},
 ): { bars: OhlcBar[]; isLiveHistory: boolean } {
+  const { liveFeedEnabled = true, liveDayVolume, precision = 3 } = options;
   const [liveBars, setLiveBars] = useState<{
     key: string;
     bars: OhlcBar[];
@@ -16,44 +25,66 @@ export function useLiveHistory(
   const requestKey = `${ticker}:${timeframe}`;
 
   useEffect(() => {
-    const controller = new AbortController();
+    let cancelled = false;
+    let activeController: AbortController | null = null;
 
-    fetch(`/api/qse/history/${encodeURIComponent(ticker)}?tf=${encodeURIComponent(timeframe)}`, {
-      signal: controller.signal,
-    })
-      .then(async (res) => {
-        if (!res.ok) return null;
-        return (await res.json()) as { bars?: OhlcBar[] };
-      })
-      .then((data) => {
-        if (data?.bars && data.bars.length >= 2) {
+    const loadHistory = async () => {
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+
+      try {
+        const res = await fetch(
+          `/api/qse/history/${encodeURIComponent(ticker)}?tf=${encodeURIComponent(timeframe)}`,
+          { signal: controller.signal },
+        );
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { bars?: OhlcBar[] };
+        if (!cancelled && data?.bars && data.bars.length >= 2) {
           setLiveBars({ key: requestKey, bars: data.bars });
         }
-      })
-      .catch(() => {
-        // Fallback to deterministic local series when offline/abort
-      });
+      } catch {
+        // Retain previous bars / fallback series on abort or transient network glitch
+      }
+    };
 
-    return () => controller.abort();
-  }, [ticker, timeframe, requestKey]);
+    void loadHistory();
+
+    if (!liveFeedEnabled) {
+      return () => {
+        cancelled = true;
+        activeController?.abort();
+      };
+    }
+
+    const isIntraday =
+      timeframe === '5m' ||
+      timeframe === '15m' ||
+      timeframe === '1H' ||
+      timeframe === '1D' ||
+      timeframe === '1W';
+    const intervalId = window.setInterval(() => {
+      void loadHistory();
+    }, isIntraday ? 15_000 : 45_000);
+
+    return () => {
+      cancelled = true;
+      activeController?.abort();
+      window.clearInterval(intervalId);
+    };
+  }, [ticker, timeframe, requestKey, liveFeedEnabled]);
 
   const syncedLiveBars = useMemo(() => {
     if (!liveBars || liveBars.key !== requestKey || liveBars.bars.length === 0) return null;
     if (!Number.isFinite(fallbackPrice) || fallbackPrice <= 0) return liveBars.bars;
-    const copy = liveBars.bars.slice();
-    const last = copy[copy.length - 1];
-    copy[copy.length - 1] = {
-      ...last,
-      close: fallbackPrice,
-      high: Math.max(last.high, fallbackPrice),
-      low: Math.min(last.low, fallbackPrice),
-      benchmarkClose:
-        Number.isFinite(benchmarkValue) && benchmarkValue > 0
-          ? benchmarkValue
-          : last.benchmarkClose,
-    };
-    return copy;
-  }, [liveBars, requestKey, fallbackPrice, benchmarkValue]);
+    return applyLiveTickToBars(liveBars.bars, {
+      timeframe,
+      livePrice: fallbackPrice,
+      liveDayVolume,
+      benchmarkValue,
+      precision,
+    });
+  }, [liveBars, requestKey, timeframe, fallbackPrice, liveDayVolume, benchmarkValue, precision]);
 
   if (syncedLiveBars) {
     return { bars: syncedLiveBars, isLiveHistory: true };
@@ -64,4 +95,3 @@ export function useLiveHistory(
     isLiveHistory: false,
   };
 }
-
