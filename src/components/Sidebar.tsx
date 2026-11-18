@@ -5,6 +5,7 @@ import {
   Bell,
   Briefcase,
   CalendarClock,
+  Coins,
   LayoutDashboard,
   Newspaper,
   ShieldCheck,
@@ -33,6 +34,7 @@ const NAV_ITEMS: Array<{
 }> = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'market', label: 'Market Screener', icon: BarChart3 },
+  { id: 'gold', label: 'Gold Rates', icon: Coins },
   { id: 'shariah-etf', label: 'Shariah & ETFs', icon: ShieldCheck },
   { id: 'dividends', label: 'Dividends', icon: CalendarClock },
   { id: 'news', label: 'News & Briefs', icon: Newspaper },

@@ -36,6 +36,7 @@ const TICKER_SET = new Set(SEO_TICKERS.map((t) => t.ticker));
 const SECTION_FROM_PATH: Record<string, NavSection> = {
   '/': 'overview',
   '/market': 'market',
+  '/gold': 'gold',
   '/shariah-etf': 'shariah-etf',
   '/dividends': 'dividends',
   '/news': 'news',
@@ -49,6 +50,7 @@ const SECTION_FROM_PATH: Record<string, NavSection> = {
 const VALID_SECTIONS: ReadonlySet<NavSection> = new Set([
   'overview',
   'market',
+  'gold',
   'shariah-etf',
   'dividends',
   'news',
@@ -119,6 +121,8 @@ export function buildCanonicalPath(section: NavSection, ticker = 'QIBK'): string
       return '/';
     case 'market':
       return `/stock/${safeTicker}`;
+    case 'gold':
+      return '/gold';
     case 'shariah-etf':
       return '/shariah-etf';
     case 'dividends':
@@ -175,6 +179,10 @@ export function buildPageSeo(options: {
     const shariahLabel = tickerMeta.isHalal ? 'Shariah compliant' : 'conventional';
     title = `${tickerMeta.ticker} (${tickerMeta.name}) Live QSE Price — Qatar Money Markets`;
     description = `Track ${tickerMeta.ticker} (${tickerMeta.name}) on the Qatar Stock Exchange.${priceSnippet}${yieldSnippet}, historical chart, and ${shariahLabel} audit.`;
+  } else if (options.section === 'gold') {
+    title = 'Qatar Gold Rates (24K, 22K, 18K QAR/g) & Live XAU/USD Chart — Qatar Money Markets';
+    description =
+      'Live Gold Ounce to USD (XAU/USD) chart synced to XE.com alongside Malabar Gold Qatar 24K, 22K, and 18K per gram rates and XE.com retail estimates in QAR.';
   } else if (options.section === 'shariah-etf') {
     title = 'QSE Halal ETFs (QATR) & Shariah Stocks — Qatar Money Markets';
     description =

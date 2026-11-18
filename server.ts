@@ -1,9 +1,16 @@
 import express from 'express';
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import { SEO_TICKERS, injectSeoIntoHtml } from './src/utils/seo.ts';
+import {
+  computeObservedMalabarKaratSpreadsPct,
+  computeObservedMalabarSpreadPct,
+  convertMalabarUsdToQatarBoard,
+} from './src/utils/goldMath.ts';
+import type { GoldRatesSnapshot } from './src/types/market.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,12 +71,15 @@ interface LiveQuotePatch {
 
 interface OhlcBar {
   date: string;
+  timestamp?: number;
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
   benchmarkClose?: number;
+  dma45?: number | null;
+  dma200?: number | null;
 }
 
 function roundTo(val: number, decimals = 3): number {
@@ -78,10 +88,26 @@ function roundTo(val: number, decimals = 3): number {
 }
 
 // Short-lived in-memory caches:
-// - liveCache: 2s max TTL for near-real-time quote updates
-// - sparklineCache: 5m TTL for 10-point daily sparklines (avoids fetching 1mo history every 2s)
+// - liveCache: 1s max TTL for real-time official QSE quote updates
+// - tvMetaCache: 5m TTL for beta & index range metadata
+// - sparklineCache: 5m TTL for 10-point daily sparklines
 let liveCache: { expiresAt: number; payload: LiveSnapshotResponse } | null = null;
+let tvMetaCache: {
+  expiresAt: number;
+  indexBounds: Record<string, { dayHigh: number; dayLow: number; week52High?: number; week52Low?: number }>;
+  betas: Record<string, number>;
+} | null = null;
+const indexIntradayBounds = new Map<string, { dayHigh: number; dayLow: number }>();
 const historyCache = new Map<string, { expiresAt: number; bars: OhlcBar[] }>();
+const dailyDmaCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    entries: Array<{ date: string; dma45: number | null; dma200: number | null }>;
+    byDate: Map<string, { dma45: number | null; dma200: number | null }>;
+    latest: { dma45: number | null; dma200: number | null };
+  }
+>();
 const sparklineCache = new Map<
   string,
   { expiresAt: number; sparkline: number[]; meta: Record<string, number> }
@@ -152,16 +178,22 @@ async function fetchYahooChart(
     const v = volumes[i] ?? 0;
 
     // Convert UTC epoch to Doha AST (UTC+3)
-    const dohaDate = new Date((timestamps[i] + 3 * 3600) * 1000);
+    const dohaEpoch = timestamps[i] + 3 * 3600;
+    const dohaDate = new Date(dohaEpoch * 1000);
+    const hhmm = `${String(dohaDate.getUTCHours()).padStart(2, '0')}:${String(
+      dohaDate.getUTCMinutes(),
+    ).padStart(2, '0')}`;
+    const isIntraday = interval.endsWith('m') || interval === '1h';
     const label =
-      range === '1d' || range === '5d'
-        ? `${String(dohaDate.getUTCHours()).padStart(2, '0')}:${String(
-            dohaDate.getUTCMinutes(),
-          ).padStart(2, '0')}`
-        : dohaDate.toISOString().slice(0, 10);
+      range === '1d'
+        ? hhmm
+        : isIntraday
+          ? `${dohaDate.toISOString().slice(5, 10)} ${hhmm}`
+          : dohaDate.toISOString().slice(0, 10);
 
     bars.push({
       date: label,
+      timestamp: dohaEpoch,
       open: roundTo(o, 3),
       high: roundTo(h, 3),
       low: roundTo(l, 3),
@@ -224,10 +256,270 @@ async function fetchYahooFastQuote(ticker: string) {
   };
 }
 
+const QE_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+  Referer: 'https://www.qe.com.qa/',
+  Origin: 'https://www.qe.com.qa',
+  Accept: 'application/json, text/javascript, */*; q=0.01',
+};
+
+interface QeMarketWatchRow {
+  Symbol?: string;
+  LastPrice?: string | number;
+  PrevClosing?: string | number;
+  OpenPrice?: string | number;
+  High?: string | number;
+  Low?: string | number;
+  W52High?: string | number;
+  W52Low?: string | number;
+  Volume?: string | number;
+  Value?: string | number;
+  CompMarketCap?: string | number;
+  PERatio?: string | number;
+  PriceBook?: string | number;
+}
+
+interface QeIndexRow {
+  Symbol?: string;
+  CurrentIndex?: string | number;
+  PrevClosing?: string | number;
+}
+
+function toPosNum(val: unknown): number | undefined {
+  if (val === null || val === undefined || val === '') return undefined;
+  const n = Number(val);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+async function getTvBackgroundMeta() {
+  const now = Date.now();
+  if (tvMetaCache && tvMetaCache.expiresAt > now) {
+    return tvMetaCache;
+  }
+
+  try {
+    const tvSymbols = [
+      'QSE:GNRI',
+      'QSE:QERI',
+      'QSE:QEAS',
+      ...TRACKED_TICKERS.map((t) => `QSE:${t}`),
+    ];
+    const res = await fetch('https://scanner.tradingview.com/global/scan', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; QatarMoneyMarkets/1.0)',
+      },
+      body: JSON.stringify({
+        symbols: { tickers: tvSymbols },
+        columns: ['name', 'high', 'low', 'price_52_week_high', 'price_52_week_low', 'beta_1_year'],
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return tvMetaCache;
+    const json = (await res.json()) as {
+      data?: Array<{ s: string; d: Array<string | number | null> }>;
+    };
+    const indexBounds: Record<
+      string,
+      { dayHigh: number; dayLow: number; week52High?: number; week52Low?: number }
+    > = {};
+    const betas: Record<string, number> = {};
+
+    for (const row of json.data ?? []) {
+      const [rawName, highVal, lowVal, w52HighVal, w52LowVal, betaVal] = row.d;
+      const sym = String(rawName ?? '');
+      if (sym === 'GNRI' || sym === 'QERI' || sym === 'QEAS') {
+        const mapped = sym === 'GNRI' ? 'QSI' : sym;
+        const dh = toPosNum(highVal);
+        const dl = toPosNum(lowVal);
+        if (dh && dl) {
+          indexBounds[mapped] = {
+            dayHigh: roundTo(dh, 2),
+            dayLow: roundTo(dl, 2),
+            week52High: toPosNum(w52HighVal) ? roundTo(Number(w52HighVal), 2) : undefined,
+            week52Low: toPosNum(w52LowVal) ? roundTo(Number(w52LowVal), 2) : undefined,
+          };
+        }
+      } else if (betaVal !== null && betaVal !== undefined && Number.isFinite(Number(betaVal))) {
+        betas[sym] = roundTo(Number(betaVal), 2);
+      }
+    }
+
+    tvMetaCache = {
+      expiresAt: now + 300_000,
+      indexBounds,
+      betas,
+    };
+    return tvMetaCache;
+  } catch {
+    return tvMetaCache;
+  }
+}
+
+let sparkRefreshInFlight = false;
+function refreshBackgroundMetaIfNeeded() {
+  const now = Date.now();
+  const needsSpark = TRACKED_TICKERS.some((t) => {
+    const c = sparklineCache.get(t);
+    return !c || c.expiresAt <= now;
+  });
+  if (needsSpark && !sparkRefreshInFlight) {
+    sparkRefreshInFlight = true;
+    Promise.allSettled(TRACKED_TICKERS.map((t) => getSparklineAndYahooMeta(t))).finally(() => {
+      sparkRefreshInFlight = false;
+    });
+  }
+  if (!tvMetaCache || tvMetaCache.expiresAt <= now) {
+    void getTvBackgroundMeta();
+  }
+}
+
+async function fetchOfficialQseSnapshot(): Promise<LiveSnapshotResponse | null> {
+  refreshBackgroundMetaIfNeeded();
+
+  const [mwRes, idxRes] = await Promise.all([
+    fetch('https://www.qe.com.qa/wp/mw_app/mw.php', {
+      method: 'POST',
+      headers: QE_HEADERS,
+      body: 'f=MarketWatch',
+      signal: AbortSignal.timeout(9000),
+    }),
+    fetch('https://www.qe.com.qa/wp/mw_app/mw.php', {
+      method: 'POST',
+      headers: QE_HEADERS,
+      body: 'f=Indices',
+      signal: AbortSignal.timeout(9000),
+    }),
+  ]);
+
+  if (!mwRes.ok || !idxRes.ok) return null;
+
+  const [mwJson, idxJson] = (await Promise.all([mwRes.json(), idxRes.json()])) as [
+    { rows?: QeMarketWatchRow[] },
+    { rows?: QeIndexRow[] },
+  ];
+  const mwRows = mwJson.rows ?? [];
+  const idxRows = idxJson.rows ?? [];
+  if (mwRows.length === 0 || idxRows.length === 0) return null;
+
+  const tvMeta = tvMetaCache;
+  const yahooMap = sparklineCache;
+
+  const indices: LiveIndexPatch[] = [];
+  for (const row of idxRows) {
+    const rawSym = String(row.Symbol ?? '');
+    if (rawSym !== 'QE20' && rawSym !== 'QERI' && rawSym !== 'QEAS') continue;
+    const mappedSym: 'QSI' | 'QERI' | 'QEAS' = rawSym === 'QE20' ? 'QSI' : rawSym;
+    const prev = toPosNum(row.PrevClosing) ?? 0;
+    const val = toPosNum(row.CurrentIndex) ?? prev;
+    if (!val) continue;
+
+    const tvB = tvMeta?.indexBounds[mappedSym];
+    const trackedB = indexIntradayBounds.get(mappedSym);
+    const dayHigh = roundTo(
+      Math.max(val, prev || val, tvB?.dayHigh ?? val, trackedB?.dayHigh ?? val),
+      2,
+    );
+    const dayLow = roundTo(
+      Math.min(val, prev || val, tvB?.dayLow ?? val, trackedB?.dayLow ?? val),
+      2,
+    );
+    indexIntradayBounds.set(mappedSym, { dayHigh, dayLow });
+
+    const proxy = mappedSym === 'QERI' ? yahooMap.get('QATR') : yahooMap.get('QETF');
+    let sparkline: number[] | undefined;
+    if (proxy && proxy.sparkline.length > 1) {
+      const lastProxy = proxy.sparkline[proxy.sparkline.length - 1] || 1;
+      sparkline = [
+        ...proxy.sparkline.slice(0, -1).map((v) => roundTo((v / lastProxy) * val, 2)),
+        roundTo(val, 2),
+      ];
+    }
+
+    indices.push({
+      symbol: mappedSym,
+      value: roundTo(val, 2),
+      previousClose: roundTo(prev || val, 2),
+      dayHigh,
+      dayLow,
+      week52High: tvB?.week52High,
+      week52Low: tvB?.week52Low,
+      sparkline,
+    });
+  }
+
+  const trackedSet = new Set<string>(TRACKED_TICKERS);
+  const quotes: Record<string, LiveQuotePatch> = {};
+
+  for (const row of mwRows) {
+    const sym = String(row.Symbol ?? '').trim().toUpperCase();
+    if (!trackedSet.has(sym)) continue;
+
+    const prevClose = toPosNum(row.PrevClosing) ?? 0;
+    const price = toPosNum(row.LastPrice) ?? prevClose;
+    if (!price) continue;
+
+    const open = toPosNum(row.OpenPrice) ?? (prevClose || price);
+    const high = toPosNum(row.High) ?? Math.max(open, price);
+    const low = toPosNum(row.Low) ?? Math.min(open, price);
+    const volume = Math.max(0, Math.round(Number(row.Volume ?? 0)));
+    const turnoverQar = Math.max(0, Math.round(Number(row.Value ?? volume * price)));
+    const w52High = toPosNum(row.W52High);
+    const w52Low = toPosNum(row.W52Low);
+    const mcap = toPosNum(row.CompMarketCap);
+    const pe = toPosNum(row.PERatio);
+    const pb = toPosNum(row.PriceBook);
+    const y = yahooMap.get(sym);
+
+    quotes[sym] = {
+      ticker: sym,
+      price: roundTo(price, 3),
+      previousClose: roundTo(prevClose || price, 3),
+      open: roundTo(open, 3),
+      dayHigh: roundTo(Math.max(high, price), 3),
+      dayLow: roundTo(Math.min(low, price), 3),
+      week52High: w52High ? roundTo(w52High, 3) : y?.meta.week52High,
+      week52Low: w52Low ? roundTo(w52Low, 3) : y?.meta.week52Low,
+      volume,
+      turnoverQar,
+      marketCapMillionQar: mcap ? Math.round(mcap / 1_000_000) : undefined,
+      peRatio: pe ? roundTo(pe, 1) : undefined,
+      pbRatio: pb ? roundTo(pb, 2) : undefined,
+      beta: tvMeta?.betas[sym],
+      sparkline: y?.sparkline ? [...y.sparkline.slice(0, -1), roundTo(price, 3)] : undefined,
+    };
+  }
+
+  if (Object.keys(quotes).length === 0) return null;
+
+  return {
+    source: 'live',
+    provider: 'Official Qatar Stock Exchange (qe.com.qa Real-Time Feed)',
+    fetchedAt: new Date().toISOString(),
+    delayNote: 'Real-time QSE feed (matches licensed broker terminals like CBQ Waseet)',
+    indices,
+    quotes,
+  };
+}
+
 async function fetchLiveQseSnapshot(forceRefresh = false): Promise<LiveSnapshotResponse> {
   const now = Date.now();
   if (!forceRefresh && liveCache && liveCache.expiresAt > now) {
     return liveCache.payload;
+  }
+
+  // Primary: Official Zero-Delay Qatar Stock Exchange Feed (qe.com.qa)
+  try {
+    const official = await fetchOfficialQseSnapshot();
+    if (official) {
+      liveCache = { expiresAt: now + 1_000, payload: official };
+      return official;
+    }
+  } catch {
+    // Fall back to TradingView + Yahoo Finance below if qe.com.qa is temporarily unreachable
   }
 
   const tvSymbols = [
@@ -421,9 +713,9 @@ async function fetchLiveQseSnapshot(forceRefresh = false): Promise<LiveSnapshotR
 
   const payload: LiveSnapshotResponse = {
     source: 'live',
-    provider: 'QSE Public Stream (TradingView + Yahoo Finance)',
+    provider: 'QSE Public Fallback (TradingView + Yahoo Finance)',
     fetchedAt: new Date().toISOString(),
-    delayNote: 'Exchange public feed (15-min QSE delay vs licensed brokers like CB Waseet)',
+    delayNote: '15-min delayed fallback feed',
     indices,
     quotes,
   };
@@ -445,6 +737,9 @@ function getSnapshotSignature(payload: LiveSnapshotResponse): string {
 }
 
 const TIMEFRAME_MAP: Record<string, { interval: string; range: string }> = {
+  '5M': { interval: '5m', range: '1d' },
+  '15M': { interval: '15m', range: '5d' },
+  '1H': { interval: '1h', range: '1mo' },
   '1D': { interval: '5m', range: '1d' },
   '1W': { interval: '1h', range: '5d' },
   '1M': { interval: '1d', range: '1mo' },
@@ -512,6 +807,7 @@ function getBaseUrl(req: express.Request): string {
 
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
   app.use(express.json());
 
   app.get('/robots.txt', (req, res) => {
@@ -526,6 +822,7 @@ async function startServer() {
     const today = new Date().toISOString().slice(0, 10);
     const urls = [
       { loc: `${base}/`, priority: '1.0', changefreq: 'hourly' },
+      { loc: `${base}/gold`, priority: '0.9', changefreq: 'hourly' },
       { loc: `${base}/shariah-etf`, priority: '0.9', changefreq: 'daily' },
       { loc: `${base}/dividends`, priority: '0.9', changefreq: 'daily' },
       { loc: `${base}/news`, priority: '0.8', changefreq: 'daily' },
@@ -560,7 +857,7 @@ async function startServer() {
       baseUrl: base,
       sitemapUrl: `${base}/sitemap.xml`,
       robotsUrl: `${base}/robots.txt`,
-      indexedUrlsCount: 6 + SEO_TICKERS.length,
+      indexedUrlsCount: 7 + SEO_TICKERS.length,
       hasVerificationToken: Boolean(verificationToken),
       hasAdsenseId: /^ca-pub-\d{8,}$/i.test(adsenseId),
       verificationTokenPreview: verificationToken ? `${verificationToken.slice(0, 8)}...` : '',
@@ -655,7 +952,7 @@ async function startServer() {
       } finally {
         streamInFlight = false;
       }
-    }, 3_000);
+    }, 2_000);
   };
 
   const stopStreamLoopIfIdle = () => {
@@ -699,6 +996,87 @@ async function startServer() {
     }
   });
 
+  async function getDailyDmaContext(yahooSymbol: string, dailyRange: '2y' | '5y') {
+    const cacheKey = `${yahooSymbol}:${dailyRange}`;
+    const now = Date.now();
+    const cached = dailyDmaCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached;
+    }
+
+    const dailyChart = await fetchYahooChart(yahooSymbol, '1d', dailyRange).catch(() => null);
+    if (!dailyChart || dailyChart.bars.length === 0) {
+      return null;
+    }
+
+    const closes = dailyChart.bars.map((b) => b.close);
+    const computeRollingSma = (period: number): Array<number | null> => {
+      const out: Array<number | null> = [];
+      let sum = 0;
+      for (let i = 0; i < closes.length; i++) {
+        sum += closes[i];
+        if (i >= period) sum -= closes[i - period];
+        out.push(i < period - 1 ? null : sum / period);
+      }
+      return out;
+    };
+
+    const sma45 = computeRollingSma(45);
+    const sma200 = computeRollingSma(200);
+    const entries: Array<{ date: string; dma45: number | null; dma200: number | null }> = [];
+    const byDate = new Map<string, { dma45: number | null; dma200: number | null }>();
+
+    for (let i = 0; i < dailyChart.bars.length; i++) {
+      const dateStr = dailyChart.bars[i].date.slice(0, 10);
+      const val = { dma45: sma45[i], dma200: sma200[i] };
+      entries.push({ date: dateStr, ...val });
+      byDate.set(dateStr, val);
+    }
+
+    const latest = entries[entries.length - 1]
+      ? { dma45: entries[entries.length - 1].dma45, dma200: entries[entries.length - 1].dma200 }
+      : { dma45: null, dma200: null };
+
+    const result = {
+      expiresAt: now + 300_000,
+      entries,
+      byDate,
+      latest,
+    };
+    dailyDmaCache.set(cacheKey, result);
+    return result;
+  }
+
+  function resolveDmaForBar(
+    bar: OhlcBar,
+    ctx: Awaited<ReturnType<typeof getDailyDmaContext>>,
+  ): { dma45: number | null; dma200: number | null } {
+    if (!ctx) return { dma45: null, dma200: null };
+    const dateKey = bar.timestamp
+      ? new Date(bar.timestamp * 1000).toISOString().slice(0, 10)
+      : bar.date.slice(0, 10);
+    const exact = ctx.byDate.get(dateKey);
+    if (exact) return exact;
+
+    // For weekly or weekend-aligned bars, pick the latest daily entry on or before dateKey
+    let lo = 0;
+    let hi = ctx.entries.length - 1;
+    let best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (ctx.entries[mid].date <= dateKey) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (best >= 0) {
+      return { dma45: ctx.entries[best].dma45, dma200: ctx.entries[best].dma200 };
+    }
+    return ctx.latest;
+  }
+
   app.get('/api/qse/history/:ticker', async (req, res) => {
     const rawTicker = String(req.params.ticker || 'QIBK').toUpperCase();
     const tf = String(req.query.tf || '3M').toUpperCase();
@@ -717,12 +1095,14 @@ async function startServer() {
           ? 'QATR.QA'
           : 'QETF.QA'
         : `${rawTicker}.QA`;
+      const dailyRange: '2y' | '5y' = tf === '3Y' || tf === '5Y' ? '5y' : '2y';
 
-      const [assetChart, benchChart] = await Promise.all([
+      const [assetChart, benchChart, dmaCtx] = await Promise.all([
         fetchYahooChart(yahooSym, cfg.interval, cfg.range),
         yahooSym === 'QETF.QA'
           ? Promise.resolve(null)
           : fetchYahooChart('QETF.QA', cfg.interval, cfg.range),
+        getDailyDmaContext(yahooSym, dailyRange),
       ]);
 
       if (!assetChart || assetChart.bars.length === 0) {
@@ -748,15 +1128,22 @@ async function startServer() {
         benchByDate.set(b.date, roundTo(b.close * 1013.7, 2));
       }
 
-      const bars: OhlcBar[] = assetChart.bars.map((b) => ({
-        date: b.date,
-        open: roundTo(b.open * scale, isIndex ? 2 : 3),
-        high: roundTo(b.high * scale, isIndex ? 2 : 3),
-        low: roundTo(b.low * scale, isIndex ? 2 : 3),
-        close: roundTo(b.close * scale, isIndex ? 2 : 3),
-        volume: b.volume,
-        benchmarkClose: benchByDate.get(b.date),
-      }));
+      const precision = isIndex ? 2 : 3;
+      const bars: OhlcBar[] = assetChart.bars.map((b) => {
+        const dma = resolveDmaForBar(b, dmaCtx);
+        return {
+          date: b.date,
+          timestamp: b.timestamp,
+          open: roundTo(b.open * scale, precision),
+          high: roundTo(b.high * scale, precision),
+          low: roundTo(b.low * scale, precision),
+          close: roundTo(b.close * scale, precision),
+          volume: b.volume,
+          benchmarkClose: benchByDate.get(b.date),
+          dma45: dma.dma45 !== null ? roundTo(dma.dma45 * scale, precision) : null,
+          dma200: dma.dma200 !== null ? roundTo(dma.dma200 * scale, precision) : null,
+        };
+      });
 
       historyCache.set(cacheKey, { expiresAt: Date.now() + 60_000, bars });
       return res.json({ source: 'live', ticker: rawTicker, timeframe: tf, bars });
@@ -766,15 +1153,280 @@ async function startServer() {
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Live Gold Rates (XE.com XAU/USD + USD/QAR + Malabar Gold Qatar 24K/22K/18K)
+  // ---------------------------------------------------------------------------
+  let goldLiveCache: { expiresAt: number; payload: GoldRatesSnapshot } | null = null;
+  const goldHistoryCache = new Map<string, { expiresAt: number; bars: OhlcBar[] }>();
+
+  async function fetchXeRate(from: string, to: string): Promise<number | null> {
+    try {
+      const url = `https://www.xe.com/currencyconverter/convert/?Amount=1&From=${encodeURIComponent(from)}&To=${encodeURIComponent(to)}`;
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!r.ok) return null;
+      const html = await r.text();
+      const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+      const re = new RegExp(`1\\s*${from}\\s*=\\s*([\\d,]+(?:\\.\\d+)?)\\s*${to}`, 'i');
+      const m = re.exec(text);
+      if (m) {
+        const val = Number(m[1].replace(/,/g, ''));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchMalabarQatarRates(usdQar: number): Promise<{
+    rates: { '24K': number; '22K': number; '18K': number; '21K'?: number } | null;
+    usdPerGram: { '24K': number; '22K': number; '18K': number } | null;
+    updatedText: string;
+    sourceLabel: string;
+  }> {
+    // Primary: Official Malabar Gold & Diamonds live currentGoldRate endpoint
+    try {
+      const r = await fetch(
+        'https://www.malabargoldanddiamonds.com/uk/malabarprice/index/currentGoldRate/',
+        {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            Accept: 'application/json, text/javascript, */*; q=0.01',
+          },
+          signal: AbortSignal.timeout(7000),
+        },
+      );
+      if (r.ok) {
+        const json = (await r.json()) as { data?: string };
+        const html = String(json.data ?? '');
+        const m24 = /24\s*KT\([^)]*\)\s*-\s*<\/td>\s*<td>\s*USD\s*([\d,.]+)\s*\/g/i.exec(html);
+        const m22 = /22\s*KT\([^)]*\)\s*-\s*<\/td>\s*<td>\s*USD\s*([\d,.]+)\s*\/g/i.exec(html);
+        const m18 = /18\s*KT\([^)]*\)\s*-\s*<\/td>\s*<td>\s*USD\s*([\d,.]+)\s*\/g/i.exec(html);
+        const dtMatch = /Updated on\s*:\s*([^<]+)/i.exec(html);
+        const tmMatch = /class="tm"[^>]*>\s*([^<]+)/i.exec(html);
+
+        const usd24 = m24 ? Number(m24[1].replace(/,/g, '')) : 0;
+        const usd22 = m22 ? Number(m22[1].replace(/,/g, '')) : 0;
+        const usd18 = m18 ? Number(m18[1].replace(/,/g, '')) : 0;
+
+        if (usd24 > 0 && usd22 > 0 && usd18 > 0) {
+          const qarRates = convertMalabarUsdToQatarBoard({ usd24, usd22, usd18, usdQar });
+          const updatedStr = [dtMatch?.[1]?.trim(), tmMatch?.[1]?.trim()]
+            .filter(Boolean)
+            .join(' · ');
+          return {
+            rates: qarRates,
+            usdPerGram: {
+              '24K': roundTo(usd24, 2),
+              '22K': roundTo(usd22, 2),
+              '18K': roundTo(usd18, 2),
+            },
+            updatedText: updatedStr ? `Malabar Official (${updatedStr})` : 'Malabar Official Live Board',
+            sourceLabel: 'Malabar Gold & Diamonds Official Feed (Qatar Retail Board)',
+          };
+        }
+      }
+    } catch {
+      // Fall through to Dubai City of Gold GCC retail benchmark below
+    }
+
+    // Secondary GCC fallback: Dubai Gold & Jewellery Group (AED / 3.6725 -> USD/g -> Malabar Qatar parity)
+    try {
+      const r2 = await fetch('https://dubaicityofgold.com/', {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        },
+        signal: AbortSignal.timeout(7000),
+      });
+      if (r2.ok) {
+        const text = (await r2.text())
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ');
+        const m = /24K Gold AED\s*([\d,.]+)\s*22K Gold AED\s*([\d,.]+).*?18K Gold AED\s*([\d,.]+)/i.exec(
+          text,
+        );
+        if (m) {
+          const usd24 = Number(m[1].replace(/,/g, '')) / 3.6725;
+          const usd22 = Number(m[2].replace(/,/g, '')) / 3.6725;
+          const usd18 = Number(m[3].replace(/,/g, '')) / 3.6725;
+          if (usd24 > 0 && usd22 > 0 && usd18 > 0) {
+            return {
+              rates: convertMalabarUsdToQatarBoard({ usd24, usd22, usd18, usdQar }),
+              usdPerGram: {
+                '24K': roundTo(usd24, 2),
+                '22K': roundTo(usd22, 2),
+                '18K': roundTo(usd18, 2),
+              },
+              updatedText: 'GCC Retail Board Fallback',
+              sourceLabel: 'GCC Retail Jewellery Board (dubaicityofgold.com)',
+            };
+          }
+        }
+      }
+    } catch {
+      // Return null if both live feeds fail
+    }
+
+    return {
+      rates: null,
+      usdPerGram: null,
+      updatedText: 'Malabar counter feed temporarily unavailable',
+      sourceLabel: 'Malabar Gold & Diamonds (unavailable)',
+    };
+  }
+
+  async function fetchLiveGoldSnapshot(forceRefresh = false): Promise<GoldRatesSnapshot> {
+    const now = Date.now();
+    if (!forceRefresh && goldLiveCache && goldLiveCache.expiresAt > now) {
+      return goldLiveCache.payload;
+    }
+
+    const [xeXauUsd, xeUsdQar, gcChart] = await Promise.all([
+      fetchXeRate('XAU', 'USD'),
+      fetchXeRate('USD', 'QAR'),
+      fetchYahooChart('GC=F', '1d', '5d').catch(() => null),
+    ]);
+
+    const usdQar = xeUsdQar ?? 3.64;
+    const malabar = await fetchMalabarQatarRates(usdQar);
+
+    const gcBars = gcChart?.bars ?? [];
+    const gcLatest = Number(gcChart?.meta?.regularMarketPrice ?? gcBars[gcBars.length - 1]?.close ?? 0);
+    const gcPrev = Number(
+      gcChart?.meta?.chartPreviousClose ??
+        gcChart?.meta?.previousClose ??
+        (gcBars.length >= 2 ? gcBars[gcBars.length - 2].close : gcLatest),
+    );
+
+    const xauUsd = xeXauUsd ?? (gcLatest > 0 ? gcLatest : 0);
+    if (xauUsd <= 0) {
+      throw new Error('Unable to fetch live XAU/USD gold rate from XE.com or fallback market feed');
+    }
+
+    const xauUsdSource = xeXauUsd
+      ? 'XE.com Live Mid-Market Rate (XAU/USD)'
+      : 'COMEX Gold Futures Fallback (GC=F)';
+    const usdQarSource = xeUsdQar ? 'XE.com Live Rate (USD/QAR)' : 'QCB Official Peg (3.64 QAR)';
+
+    const calibratedKaratSpreadsPct = computeObservedMalabarKaratSpreadsPct(
+      xauUsd,
+      usdQar,
+      malabar.rates,
+    );
+    const calibratedSpreadPct = computeObservedMalabarSpreadPct(
+      xauUsd,
+      usdQar,
+      malabar.rates,
+      4.87,
+    );
+
+    const payload: GoldRatesSnapshot = {
+      fetchedAt: new Date().toISOString(),
+      xauUsd: roundTo(xauUsd, 2),
+      previousXauUsd: roundTo(gcPrev > 0 ? gcPrev : xauUsd, 2),
+      xauUsdSource,
+      usdQar: roundTo(usdQar, 4),
+      usdQarSource,
+      xauQar: roundTo(xauUsd * usdQar, 2),
+      xeChartUrl: 'https://www.xe.com/currencycharts/?from=XAU&to=USD',
+      xeConverterUrl: 'https://www.xe.com/currencyconverter/convert/?Amount=1&From=XAU&To=USD',
+      xeQarConverterUrl: 'https://www.xe.com/currencyconverter/convert/?Amount=1&From=XAU&To=QAR',
+      malabarOfficialUrl: 'https://www.malabargoldanddiamonds.com/ae/',
+      malabarStoresUrl: 'https://www.malabargoldanddiamonds.com/uk/stores/qatar',
+      malabarSourceLabel: malabar.sourceLabel,
+      malabarUpdatedText: malabar.updatedText,
+      malabarUsdPerGram: malabar.usdPerGram,
+      malabarRatesQarPerGram: malabar.rates,
+      calibratedSpreadPct,
+      calibratedKaratSpreadsPct,
+    };
+
+    goldLiveCache = { expiresAt: now + 20_000, payload };
+    return payload;
+  }
+
+  app.get('/api/gold/live', async (req, res) => {
+    try {
+      const force = req.query.refresh === '1';
+      const payload = await fetchLiveGoldSnapshot(force);
+      res.json(payload);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to fetch live gold rates';
+      res.status(502).json({ error: message });
+    }
+  });
+
+  app.get('/api/gold/history', async (req, res) => {
+    const tf = String(req.query.tf || '1M').toUpperCase();
+    const cfg = TIMEFRAME_MAP[tf] ?? TIMEFRAME_MAP['1M'];
+    const cached = goldHistoryCache.get(tf);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ source: 'xe-anchored', symbol: 'XAU/USD', timeframe: tf, bars: cached.bars });
+    }
+
+    try {
+      const dailyRange: '2y' | '5y' = tf === '3Y' || tf === '5Y' ? '5y' : '2y';
+      const [goldChart, dmaCtx, liveSnapshot] = await Promise.all([
+        fetchYahooChart('GC=F', cfg.interval, cfg.range),
+        getDailyDmaContext('GC=F', dailyRange),
+        fetchLiveGoldSnapshot(false).catch(() => null),
+      ]);
+
+      if (!goldChart || goldChart.bars.length === 0) {
+        return res.status(404).json({ error: 'No historical XAU/USD bars found' });
+      }
+
+      const rawLastClose = goldChart.bars[goldChart.bars.length - 1].close || 1;
+      const scale = liveSnapshot && liveSnapshot.xauUsd > 0 ? liveSnapshot.xauUsd / rawLastClose : 1;
+
+      const bars: OhlcBar[] = goldChart.bars.map((b) => {
+        const dma = resolveDmaForBar(b, dmaCtx);
+        return {
+          date: b.date,
+          timestamp: b.timestamp,
+          open: roundTo(b.open * scale, 2),
+          high: roundTo(b.high * scale, 2),
+          low: roundTo(b.low * scale, 2),
+          close: roundTo(b.close * scale, 2),
+          volume: b.volume,
+          dma45: dma.dma45 !== null ? roundTo(dma.dma45 * scale, 2) : null,
+          dma200: dma.dma200 !== null ? roundTo(dma.dma200 * scale, 2) : null,
+        };
+      });
+
+      goldHistoryCache.set(tf, { expiresAt: Date.now() + 30_000, bars });
+      return res.json({ source: 'xe-anchored', symbol: 'XAU/USD', timeframe: tf, bars });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to fetch gold chart history';
+      return res.status(502).json({ error: message });
+    }
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+        hmr: process.env.DISABLE_HMR !== 'true',
+      },
       appType: 'spa',
     });
 
     const seoHtmlRoutes = [
       '/',
       '/market',
+      '/gold',
       '/stock/:ticker',
       '/shariah-etf',
       '/dividends',
@@ -837,7 +1489,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Qatar Money Markets QSE server running on http://0.0.0.0:${PORT}`);
   });
 }

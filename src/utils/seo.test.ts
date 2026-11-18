@@ -29,6 +29,11 @@ test('parseRouteState parses clean /stock/:ticker and section paths', () => {
     ticker: 'QIBK',
     searchQuery: '',
   });
+  assert.deepEqual(parseRouteState('/gold', ''), {
+    section: 'gold',
+    ticker: 'QIBK',
+    searchQuery: '',
+  });
 });
 
 test('parseRouteState preserves query parameter backward compatibility and Google SearchAction ?q=', () => {
@@ -47,6 +52,7 @@ test('parseRouteState preserves query parameter backward compatibility and Googl
 test('buildCanonicalPath produces clean indexable URLs', () => {
   assert.equal(buildCanonicalPath('overview'), '/');
   assert.equal(buildCanonicalPath('market', 'qibk'), '/stock/QIBK');
+  assert.equal(buildCanonicalPath('gold'), '/gold');
   assert.equal(buildCanonicalPath('dividends'), '/dividends');
   assert.equal(buildCanonicalPath('pro-legal'), '/plus');
 });

@@ -1226,8 +1226,11 @@ export function generateHistoricalSeries(
   benchmarkBase = 10642.85,
 ): OhlcBar[] {
   const counts: Record<Timeframe, number> = {
-    '1D': 26,
-    '1W': 35,
+    '5m': 40,
+    '15m': 60,
+    '1H': 64,
+    '1D': 45,
+    '1W': 40,
     '1M': 30,
     '3M': 65,
     '1Y': 90,
@@ -1235,6 +1238,9 @@ export function generateHistoricalSeries(
     '5Y': 120,
   };
   const volatilityByTf: Record<Timeframe, number> = {
+    '5m': 0.0022,
+    '15m': 0.0032,
+    '1H': 0.005,
     '1D': 0.0035,
     '1W': 0.006,
     '1M': 0.0095,
@@ -1244,6 +1250,9 @@ export function generateHistoricalSeries(
     '5Y': 0.032,
   };
   const driftByTf: Record<Timeframe, number> = {
+    '5m': 0.005,
+    '15m': 0.011,
+    '1H': 0.022,
     '1D': 0.008,
     '1W': 0.016,
     '1M': 0.038,
@@ -1254,78 +1263,101 @@ export function generateHistoricalSeries(
   };
 
   const count = counts[timeframe];
+  const lookbackPad = 210;
+  const totalLen = count + lookbackPad;
   const vol = volatilityByTf[timeframe];
   const totalDrift = driftByTf[timeframe];
   const seed = hashTicker(ticker + timeframe);
 
-  // Build backwards from currentPrice so the final bar closes at exact live price
-  const closes: number[] = new Array(count);
+  // Build backwards from currentPrice with 210-bar lookback so 45 DMA & 200 DMA are defined on every bar
+  const extendedCloses: number[] = new Array(totalLen);
   const benchCloses: number[] = new Array(count);
-  closes[count - 1] = currentPrice;
+  extendedCloses[totalLen - 1] = currentPrice;
   benchCloses[count - 1] = benchmarkBase;
 
   const bearishTickers = new Set(['CBQK', 'DHBK', 'MPHC', 'QATI', 'QFLS']);
   const directionMultiplier = bearishTickers.has(ticker) ? -0.35 : 1;
 
   const avgStepDrift = (totalDrift * directionMultiplier) / count;
-  for (let i = count - 2; i >= 0; i--) {
+  for (let i = totalLen - 2; i >= 0; i--) {
     const wave =
       Math.sin((seed % 97) * 0.1 + i * 0.34) * 0.45 +
       Math.cos((seed % 53) * 0.2 + i * 0.15) * 0.3;
     const stepReturn = avgStepDrift + wave * (vol * 0.85);
-    closes[i] = Math.max(0.2, closes[i + 1] / (1 + stepReturn));
-
+    extendedCloses[i] = Math.max(0.2, extendedCloses[i + 1] / (1 + stepReturn));
+  }
+  for (let i = count - 2; i >= 0; i--) {
     const benchWave = Math.sin(i * 0.36 + 1.1) * 0.5 + Math.cos(i * 0.15) * 0.3;
     const benchReturn = (totalDrift * 0.72) / count + benchWave * (vol * 0.7);
     benchCloses[i] = Math.max(500, benchCloses[i + 1] / (1 + benchReturn));
   }
 
-  const now = new Date('2026-11-15T13:30:00+03:00');
+  const closes = extendedCloses.slice(lookbackPad);
+
+  const computeRollingMean = (idxInExt: number, period: number): number => {
+    let sum = 0;
+    for (let k = idxInExt - period + 1; k <= idxInExt; k++) {
+      sum += extendedCloses[k];
+    }
+    return roundTo(sum / period, 3);
+  };
+
+  const now = new Date('2026-11-18T13:15:00Z');
   const bars: OhlcBar[] = [];
 
   for (let i = 0; i < count; i++) {
-    const close = roundTo(closes[i], 2);
+    const close = roundTo(closes[i], 3);
     const prev = i > 0 ? closes[i - 1] : close * 0.996;
-    const open = roundTo(prev, 2);
+    const open = roundTo(prev, 3);
     const wiggle = Math.abs(Math.sin(seed + i * 1.7)) * vol * close * 0.85;
-    const high = roundTo(Math.max(open, close) + wiggle, 2);
-    const low = roundTo(Math.max(0.1, Math.min(open, close) - wiggle * 0.85), 2);
+    const high = roundTo(Math.max(open, close) + wiggle, 3);
+    const low = roundTo(Math.max(0.1, Math.min(open, close) - wiggle * 0.85), 3);
     const barVolume = Math.round(
       (450000 + (seed % 900000)) * (0.65 + Math.abs(Math.cos(i * 0.7 + seed)) * 0.9),
     );
 
     let dateLabel = '';
-    if (timeframe === '1D') {
-      const minsFromOpen = Math.round((i / (count - 1)) * 225); // 09:30 to 13:15 AST
+    let timestampSec = Math.floor(now.getTime() / 1000);
+    if (timeframe === '1D' || timeframe === '5m') {
+      const minsFromOpen = Math.round((i / Math.max(1, count - 1)) * 225); // 09:30 to 13:15 AST
       const totalMins = 9 * 60 + 30 + minsFromOpen;
       const hh = String(Math.floor(totalMins / 60)).padStart(2, '0');
       const mm = String(totalMins % 60).padStart(2, '0');
       dateLabel = `${hh}:${mm}`;
+      timestampSec = Math.floor(Date.UTC(2026, 10, 18, Math.floor(totalMins / 60), totalMins % 60, 0) / 1000);
+    } else if (timeframe === '15m' || timeframe === '1H' || timeframe === '1W') {
+      const stepSecs = timeframe === '15m' ? 900 : 3600;
+      timestampSec = Math.floor(now.getTime() / 1000) - (count - 1 - i) * stepSecs;
+      const d = new Date(timestampSec * 1000);
+      dateLabel = `${d.toISOString().slice(5, 10)} ${d.toISOString().slice(11, 16)}`;
     } else {
       const daysBack =
-        timeframe === '1W'
-          ? Math.round(((count - 1 - i) / count) * 7)
-          : timeframe === '1M'
-            ? count - 1 - i
-            : timeframe === '3M'
-              ? Math.round(((count - 1 - i) / count) * 90)
-              : timeframe === '1Y'
-                ? Math.round(((count - 1 - i) / count) * 365)
-                : timeframe === '3Y'
-                  ? Math.round(((count - 1 - i) / count) * 1095)
-                  : Math.round(((count - 1 - i) / count) * 1825);
+        timeframe === '1M'
+          ? count - 1 - i
+          : timeframe === '3M'
+            ? Math.round(((count - 1 - i) / count) * 90)
+            : timeframe === '1Y'
+              ? Math.round(((count - 1 - i) / count) * 365)
+              : timeframe === '3Y'
+                ? Math.round(((count - 1 - i) / count) * 1095)
+                : Math.round(((count - 1 - i) / count) * 1825);
       const d = new Date(now.getTime() - daysBack * 86400000);
       dateLabel = d.toISOString().slice(0, 10);
+      timestampSec = Math.floor(d.getTime() / 1000);
     }
 
+    const extIdx = i + lookbackPad;
     bars.push({
       date: dateLabel,
+      timestamp: timestampSec,
       open,
       high,
       low,
       close,
       volume: barVolume,
       benchmarkClose: roundTo(benchCloses[i], 2),
+      dma45: computeRollingMean(extIdx, 45),
+      dma200: computeRollingMean(extIdx, 200),
     });
   }
 

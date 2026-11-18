@@ -7,6 +7,7 @@ interface MarketTickerStripProps {
   indices: MarketIndex[];
   securities: QseSecurity[];
   lastLiveSyncAt?: string | null;
+  feedLabel?: string;
   priceFlashes?: Record<string, 'up' | 'down'>;
   onSelectIndex?: (symbol: MarketIndex['symbol']) => void;
 }
@@ -15,6 +16,7 @@ export const MarketTickerStrip: React.FC<MarketTickerStripProps> = ({
   indices,
   securities,
   lastLiveSyncAt,
+  feedLabel = 'Real-time QSE feed',
   priceFlashes = {},
   onSelectIndex,
 }) => {
@@ -94,8 +96,8 @@ export const MarketTickerStrip: React.FC<MarketTickerStripProps> = ({
             <span className="text-xs font-normal text-slate-500 dark:text-slate-400">QAR</span>
           </div>
           <div className="mt-0.5 text-xs text-slate-600 dark:text-slate-400">
-            {shariahCount} Halal · {securities.filter((s) => s.assetType === 'etf').length} ETFs ·
-            15m QSE public feed
+            {shariahCount} Halal · {securities.filter((s) => s.assetType === 'etf').length} ETFs ·{' '}
+            {feedLabel}
           </div>
         </div>
       </div>

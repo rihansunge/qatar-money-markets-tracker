@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  calculateBollingerBands,
+  calculateEMASeries,
+  calculateFibonacciLevels,
   calculateMACD,
   calculatePortfolioAnalytics,
   calculateRSI,
@@ -17,6 +20,7 @@ import {
   parsePortfolioCsv,
   simulateMarketTick,
 } from './marketMath';
+import { normalizeBarsForTradingView } from './chartSeries';
 import {
   generateHistoricalSeries,
   INITIAL_INVESTOR_FLOWS,
@@ -252,4 +256,45 @@ test('diffLiveTicks detects up and down index and security price movements', () 
   assert.equal(flashes.QSI, 'up');
   assert.equal(flashes.QIBK, 'down');
   assert.equal(flashes.QNBK, undefined);
+});
+
+test('calculateEMASeries, calculateBollingerBands, and calculateFibonacciLevels compute accurate studies', () => {
+  const closes = Array.from({ length: 30 }, (_, i) => 20 + i * 0.25);
+  const ema20 = calculateEMASeries(closes, 20);
+  assert.equal(ema20[18], null);
+  assert.ok(typeof ema20[19] === 'number' && ema20[29]! > ema20[19]!);
+
+  const bb = calculateBollingerBands(closes, 20, 2);
+  assert.equal(bb[18], null);
+  assert.ok(bb[29]!.upper > bb[29]!.middle && bb[29]!.middle > bb[29]!.lower);
+
+  const fib = calculateFibonacciLevels(24.0, 20.0);
+  assert.equal(fib.length, 7);
+  assert.equal(fib[0].price, 24);
+  assert.equal(fib[3].price, 22); // 50.0%
+  assert.equal(fib[6].price, 20);
+});
+
+test('normalizeBarsForTradingView produces strictly ascending timestamps for 5m, 15m, 1H, and 1W', () => {
+  for (const tf of ['5m', '15m', '1H', '1W'] as const) {
+    const bars = generateHistoricalSeries('QIBK', 21.7, tf, 10000);
+    const tvBars = normalizeBarsForTradingView(bars, tf);
+    assert.equal(tvBars.length, bars.length);
+    for (let i = 1; i < tvBars.length; i++) {
+      assert.ok(Number(tvBars[i].time) > Number(tvBars[i - 1].time));
+    }
+  }
+});
+
+test('generateHistoricalSeries populates 45 DMA and 200 DMA on every bar across short and long timeframes', () => {
+  for (const tf of ['15m', '1M', '3M', '1Y'] as const) {
+    const bars = generateHistoricalSeries('QIBK', 20.84, tf, 10107);
+    assert.ok(bars.length > 0);
+    for (const bar of bars) {
+      assert.equal(typeof bar.dma45, 'number');
+      assert.equal(typeof bar.dma200, 'number');
+      assert.ok((bar.dma45 ?? 0) > 0);
+      assert.ok((bar.dma200 ?? 0) > 0);
+    }
+  }
 });

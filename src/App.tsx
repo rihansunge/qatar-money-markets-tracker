@@ -45,6 +45,7 @@ import { TopBar } from './components/TopBar';
 import { MarketTickerStrip } from './components/MarketTickerStrip';
 import { OverviewView } from './components/OverviewView';
 import { MarketScreenerView } from './components/MarketScreenerView';
+import { GoldRatesView } from './components/GoldRatesView';
 import { EtfShariahView } from './components/EtfShariahView';
 import { DividendsView } from './components/DividendsView';
 import { NewsView } from './components/NewsView';
@@ -91,6 +92,7 @@ export default function App() {
   const [indices, setIndices] = useState<MarketIndex[]>(INITIAL_QSE_INDICES);
   const [securities, setSecurities] = useState<QseSecurity[]>(INITIAL_QSE_SECURITIES);
   const [lastLiveSyncAt, setLastLiveSyncAt] = useState<string | null>(null);
+  const [feedLabel, setFeedLabel] = useState<string>('Real-time QSE feed');
   const [priceFlashes, setPriceFlashes] = useState<Record<string, 'up' | 'down'>>({});
   const alertsRef = useRef<PriceAlert[]>([]);
   const indicesRef = useRef<MarketIndex[]>(INITIAL_QSE_INDICES);
@@ -247,6 +249,11 @@ export default function App() {
       setIndices(merged.indices);
       setSecurities(merged.securities);
       setLastLiveSyncAt(payload.fetchedAt || new Date().toISOString());
+      if (payload.delayNote?.includes('15-min')) {
+        setFeedLabel('15m delayed fallback');
+      } else {
+        setFeedLabel('Real-time QSE feed');
+      }
 
       const prevAlerts = alertsRef.current;
       const { updatedAlerts, newlyTriggered } = evaluatePriceAlerts(
@@ -504,6 +511,7 @@ export default function App() {
             indices={indices}
             securities={securities}
             lastLiveSyncAt={lastLiveSyncAt}
+            feedLabel={feedLabel}
             priceFlashes={priceFlashes}
             onSelectIndex={() => setActiveSection('overview')}
           />
@@ -546,6 +554,8 @@ export default function App() {
               priceFlashes={priceFlashes}
             />
           )}
+
+          {activeSection === 'gold' && <GoldRatesView liveFeedEnabled={liveFeedEnabled} />}
 
           {activeSection === 'shariah-etf' && (
             <EtfShariahView

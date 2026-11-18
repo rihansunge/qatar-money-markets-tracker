@@ -20,6 +20,7 @@ interface TopBarProps {
 const SECTION_TITLES: Record<NavSection, string> = {
   overview: 'QSE Market Overview',
   market: 'Market Screener & Charts',
+  gold: 'Live Gold Rates (XAU/USD & Qatar)',
   'shariah-etf': 'Shariah Compliance & ETFs',
   dividends: 'Upcoming Dividends Calendar',
   news: 'Daily Updates & Stock News',

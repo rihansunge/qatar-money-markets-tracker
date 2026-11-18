@@ -171,6 +171,92 @@ export function calculateSMA(closes: number[], period: number): Array<number | n
   return result;
 }
 
+export function calculateEMASeries(closes: number[], period: number): Array<number | null> {
+  if (period <= 0 || closes.length === 0) return closes.map(() => null);
+  const result: Array<number | null> = [];
+  const k = 2 / (period + 1);
+  let ema: number | null = null;
+  let seedSum = 0;
+
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period - 1) {
+      seedSum += closes[i];
+      result.push(null);
+    } else if (i === period - 1) {
+      seedSum += closes[i];
+      ema = seedSum / period;
+      result.push(roundTo(ema, 3));
+    } else {
+      ema = closes[i] * k + (ema as number) * (1 - k);
+      result.push(roundTo(ema, 3));
+    }
+  }
+
+  return result;
+}
+
+export interface BollingerBandPoint {
+  upper: number;
+  middle: number;
+  lower: number;
+}
+
+export function calculateBollingerBands(
+  closes: number[],
+  period = 20,
+  stdDevMultiplier = 2,
+): Array<BollingerBandPoint | null> {
+  if (period <= 1 || closes.length === 0) return closes.map(() => null);
+  const result: Array<BollingerBandPoint | null> = [];
+
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period - 1) {
+      result.push(null);
+      continue;
+    }
+    const slice = closes.slice(i - period + 1, i + 1);
+    const mean = slice.reduce((acc, v) => acc + v, 0) / period;
+    const variance = slice.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / period;
+    const sd = Math.sqrt(variance);
+    result.push({
+      upper: roundTo(mean + stdDevMultiplier * sd, 3),
+      middle: roundTo(mean, 3),
+      lower: roundTo(Math.max(0, mean - stdDevMultiplier * sd), 3),
+    });
+  }
+
+  return result;
+}
+
+export interface FibonacciLevel {
+  ratio: number;
+  label: string;
+  price: number;
+  color: string;
+}
+
+const FIB_RATIOS: Array<{ ratio: number; label: string; color: string }> = [
+  { ratio: 0, label: '0.0%', color: '#64748B' },
+  { ratio: 0.236, label: '23.6%', color: '#0284C7' },
+  { ratio: 0.382, label: '38.2%', color: '#0D9488' },
+  { ratio: 0.5, label: '50.0%', color: '#D97706' },
+  { ratio: 0.618, label: '61.8%', color: '#8A1538' },
+  { ratio: 0.786, label: '78.6%', color: '#7C3AED' },
+  { ratio: 1, label: '100.0%', color: '#64748B' },
+];
+
+export function calculateFibonacciLevels(high: number, low: number): FibonacciLevel[] {
+  const top = Math.max(high, low);
+  const bottom = Math.min(high, low);
+  const diff = top - bottom;
+  return FIB_RATIOS.map((lvl) => ({
+    ratio: lvl.ratio,
+    label: lvl.label,
+    price: roundTo(top - diff * lvl.ratio, top < 10 ? 3 : 2),
+    color: lvl.color,
+  }));
+}
+
 export function calculateRSI(closes: number[], period = 14): number {
   if (closes.length < period + 1) return 50;
 
@@ -498,6 +584,8 @@ export function formatQarPrice(price: number): string {
 
 export interface LiveQseSnapshotPayload {
   source: string;
+  provider?: string;
+  delayNote?: string;
   fetchedAt: string;
   indices: Array<{
     symbol: 'QSI' | 'QERI' | 'QEAS';

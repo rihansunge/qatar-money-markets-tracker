@@ -1,6 +1,7 @@
 export type NavSection =
   | 'overview'
   | 'market'
+  | 'gold'
   | 'shariah-etf'
   | 'dividends'
   | 'news'
@@ -21,7 +22,7 @@ export type Sector =
 
 export type AssetType = 'stock' | 'etf';
 
-export type Timeframe = '1D' | '1W' | '1M' | '3M' | '1Y' | '3Y' | '5Y';
+export type Timeframe = '5m' | '15m' | '1H' | '1D' | '1W' | '1M' | '3M' | '1Y' | '3Y' | '5Y';
 
 export interface ShariahAudit {
   isCompliant: boolean;
@@ -88,12 +89,15 @@ export interface MarketIndex {
 
 export interface OhlcBar {
   date: string;
+  timestamp?: number;
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
   benchmarkClose?: number;
+  dma45?: number | null;
+  dma200?: number | null;
 }
 
 export interface DividendEvent {
@@ -235,4 +239,40 @@ export interface MarketSentimentSummary {
   near52WeekLowCount: number;
   netInstitutionalFlowMillionQar: number;
   netForeignFlowMillionQar: number;
+}
+
+export type GoldKarat = '24K' | '22K' | '18K';
+
+export interface GoldRatesSnapshot {
+  fetchedAt: string;
+  xauUsd: number;
+  previousXauUsd: number;
+  xauUsdSource: string;
+  usdQar: number;
+  usdQarSource: string;
+  xauQar: number;
+  xeChartUrl: string;
+  xeConverterUrl: string;
+  xeQarConverterUrl: string;
+  malabarOfficialUrl: string;
+  malabarStoresUrl: string;
+  malabarSourceLabel: string;
+  malabarUpdatedText: string;
+  malabarUsdPerGram?: {
+    '24K': number;
+    '22K': number;
+    '18K': number;
+  } | null;
+  malabarRatesQarPerGram: {
+    '24K': number;
+    '22K': number;
+    '18K': number;
+    '21K'?: number;
+  } | null;
+  calibratedSpreadPct: number;
+  calibratedKaratSpreadsPct: {
+    '24K': number;
+    '22K': number;
+    '18K': number;
+  };
 }
