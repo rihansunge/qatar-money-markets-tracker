@@ -1,0 +1,6 @@
+{
+  "name": "DohaBorsa — Qatar Stock Exchange Tracker",
+  "description": "Real-time Qatar Stock Exchange (QSE) market tracker with Shariah-compliant and Halal ETF screening, dividend calendar, portfolio analytics, historical charts, sentiment analysis, and price alert notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,11 +1,34 @@
-<div align="center">
+# Qatar Money Markets
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Real-time Qatar Stock Exchange (QSE) market tracker, Shariah compliance & QATR Halal ETF analytics, dividend calendar, portfolio tracker, and price alerts.
 
-  <h1>Built with AI Studio</h2>
+## Requirements
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+- **Node.js** `>=22.12.0`
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## Run Locally
 
-</div>
+```bash
+npm install
+npm run dev
+```
+
+The server listens on `http://localhost:3000`.
+
+## Build & Run in Production
+
+```bash
+npm install
+npm run build
+npm start
+```
+
+## Deploying from GitHub (Render / Railway / Cloud Run)
+
+- **Build Command:** `npm install && npm run build`
+- **Start Command:** `npm start`
+- **Port:** `3000` (or `process.env.PORT` provided automatically by the host)
+- **Optional Environment Variables:**
+  - `APP_URL`: Your public HTTPS URL (e.g., `https://qatarmoneymarkets.com`)
+  - `GOOGLE_SITE_VERIFICATION`: Google Search Console verification token (also configurable inside **Plus & Legal → Google Search & SEO**)
+  - `VITE_ADSENSE_CLIENT_ID`: Google AdSense Publisher ID `ca-pub-...` (also configurable inside **Plus & Legal → Plus & AdSense**)
