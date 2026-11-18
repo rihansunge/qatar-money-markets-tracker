@@ -57,7 +57,7 @@ test('buildCanonicalPath produces clean indexable URLs', () => {
   assert.equal(buildCanonicalPath('pro-legal'), '/plus');
 });
 
-test('buildPageSeo generates SearchAction WebSite schema and ticker-specific metadata', () => {
+test('buildPageSeo generates SearchAction WebSite, WebApplication, FAQPage schemas and bilingual keywords', () => {
   const seo = buildPageSeo({
     baseUrl: 'https://qatarmoneymarkets.example.com/',
     section: 'market',
@@ -72,24 +72,49 @@ test('buildPageSeo generates SearchAction WebSite schema and ticker-specific met
   assert.ok(seo.title.includes('Qatar Money Markets'));
   assert.ok(seo.description.includes('2.089 QAR'));
   assert.ok(seo.description.includes('5.27%'));
-  assert.equal(seo.structuredData.length, 2);
+  assert.ok(seo.keywords.includes('QATR share price QAR'));
+  assert.ok(seo.keywords.includes('سعر سهم QATR'));
+  assert.equal(seo.structuredData.length, 3);
   assert.equal(seo.structuredData[0]['@type'], 'WebSite');
   assert.equal(seo.structuredData[1]['@type'], 'WebApplication');
+  assert.equal(seo.structuredData[2]['@type'], 'FAQPage');
+
+  const goldSeo = buildPageSeo({
+    baseUrl: 'https://qatarmoneymarkets.example.com',
+    section: 'gold',
+  });
+  const goldFaq = goldSeo.structuredData[2] as { mainEntity: Array<{ name: string }> };
+  assert.ok(goldSeo.keywords.includes('سعر الذهب اليوم في قطر'));
+  assert.ok(goldSeo.keywords.includes('Malabar Gold Qatar rate today'));
+  assert.ok(goldFaq.mainEntity.some((q) => q.name.includes('24K, 22K, and 18K')));
+  assert.ok(goldFaq.mainEntity.some((q) => q.name.includes('سعر الذهب اليوم')));
 });
 
-test('injectSeoIntoHtml injects canonical, OG image, verification tag, and dynamic title into HTML', () => {
-  const sampleHtml = `<!doctype html><html><head><title>Old</title><meta name="description" content="Old" /><meta property="og:title" content="Old" /><meta property="og:description" content="Old" /><meta name="twitter:title" content="Old" /><meta name="twitter:description" content="Old" /></head><body></body></html>`;
-  const result = injectSeoIntoHtml(sampleHtml, {
+test('injectSeoIntoHtml injects canonical, OG image, FAQPage JSON-LD, keywords, and preserves verification tag when not overridden', () => {
+  const sampleHtml = `<!doctype html><html><head><title>Old</title><meta name="description" content="Old" /><meta name="keywords" content="Old" /><meta name="google-site-verification" content="bakedToken123" /><meta property="og:title" content="Old" /><meta property="og:description" content="Old" /><meta name="twitter:title" content="Old" /><meta name="twitter:description" content="Old" /></head><body></body></html>`;
+  const preserved = injectSeoIntoHtml(sampleHtml, {
+    baseUrl: 'https://qatarmoneymarkets.com',
+    pathname: '/gold',
+    search: '',
+  });
+
+  assert.ok(preserved.includes('<meta name="google-site-verification" content="bakedToken123" />'));
+  assert.ok(preserved.includes('"@type":"FAQPage"'));
+  assert.ok(preserved.includes('سعر الذهب اليوم في قطر'));
+  assert.ok(preserved.includes('<link rel="canonical" href="https://qatarmoneymarkets.com/gold" />'));
+
+  const overridden = injectSeoIntoHtml(sampleHtml, {
     baseUrl: 'https://qatarmoneymarkets.com',
     pathname: '/stock/QIBK',
     search: '',
     googleSiteVerification: 'abc123token',
   });
 
-  assert.ok(result.includes('<title>QIBK (Qatar Islamic Bank) Live QSE Price — Qatar Money Markets</title>'));
-  assert.ok(result.includes('<link rel="canonical" href="https://qatarmoneymarkets.com/stock/QIBK" />'));
-  assert.ok(result.includes('<meta property="og:image" content="https://qatarmoneymarkets.com/og-card.jpg" />'));
-  assert.ok(result.includes('<meta name="google-site-verification" content="abc123token" />'));
-  assert.ok(result.includes('SearchAction'));
+  assert.ok(overridden.includes('<title>QIBK (Qatar Islamic Bank) Live QSE Price — Qatar Money Markets</title>'));
+  assert.ok(overridden.includes('<link rel="canonical" href="https://qatarmoneymarkets.com/stock/QIBK" />'));
+  assert.ok(overridden.includes('<meta property="og:image" content="https://qatarmoneymarkets.com/og-card.jpg" />'));
+  assert.ok(overridden.includes('<meta name="google-site-verification" content="abc123token" />'));
+  assert.ok(!overridden.includes('bakedToken123'));
+  assert.ok(overridden.includes('SearchAction'));
   assert.equal(SEO_TICKERS.length, 20);
 });

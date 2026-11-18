@@ -847,9 +847,22 @@ async function startServer() {
     const base = getBaseUrl(req);
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(base);
     const runtimeCfg = await loadSeoConfig();
+    let bakedVerificationToken = '';
+    try {
+      const indexPath =
+        process.env.NODE_ENV === 'production'
+          ? path.resolve(__dirname, 'dist', 'index.html')
+          : path.resolve(__dirname, 'index.html');
+      const indexHtml = await fs.readFile(indexPath, 'utf8');
+      const match = /<meta\s+name="google-site-verification"\s+content="([^"]+)"/i.exec(indexHtml);
+      bakedVerificationToken = (match?.[1] ?? '').trim();
+    } catch {
+      bakedVerificationToken = '';
+    }
     const verificationToken =
       (process.env.GOOGLE_SITE_VERIFICATION || '').trim() ||
-      (runtimeCfg.googleSiteVerification || '').trim();
+      (runtimeCfg.googleSiteVerification || '').trim() ||
+      bakedVerificationToken;
     const adsenseId =
       (process.env.VITE_ADSENSE_CLIENT_ID || '').trim() ||
       (runtimeCfg.adsenseClientId || '').trim();

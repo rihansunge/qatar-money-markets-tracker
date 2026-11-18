@@ -7,6 +7,7 @@ import {
   getDayChange,
   type ZakatMethod,
 } from '../utils/marketMath';
+import { SeoFaqSection } from './SeoFaqSection';
 
 interface EtfShariahViewProps {
   securities: QseSecurity[];
@@ -456,6 +457,11 @@ export const EtfShariahView: React.FC<EtfShariahViewProps> = ({
           </div>
         </div>
       </section>
+
+      <SeoFaqSection
+        section="shariah-etf"
+        heading="QSE Halal ETFs, Shariah Stocks & Zakat FAQ (EN / العربية)"
+      />
     </div>
   );
 };

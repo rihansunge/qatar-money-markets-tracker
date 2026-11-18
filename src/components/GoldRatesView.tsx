@@ -18,6 +18,7 @@ import {
 } from '../utils/goldMath';
 import { applyLiveTickToBars } from '../utils/chartSeries';
 import { HistoricalChart } from './HistoricalChart';
+import { SeoFaqSection } from './SeoFaqSection';
 
 interface GoldRatesViewProps {
   liveFeedEnabled: boolean;
@@ -757,6 +758,11 @@ export const GoldRatesView: React.FC<GoldRatesViewProps> = ({ liveFeedEnabled })
           </div>
         </aside>
       </div>
+
+      <SeoFaqSection
+        section="gold"
+        heading="Qatar Gold Rate FAQ & Bilingual Guide (EN / العربية)"
+      />
     </div>
   );
 };

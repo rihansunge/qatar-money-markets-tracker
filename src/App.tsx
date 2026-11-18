@@ -156,6 +156,7 @@ export default function App() {
     };
 
     setMeta('meta[name="description"]', 'content', seo.description);
+    setMeta('meta[name="keywords"]', 'content', seo.keywords);
     setMeta('meta[property="og:title"]', 'content', seo.title);
     setMeta('meta[property="og:description"]', 'content', seo.description);
     setMeta('meta[property="og:url"]', 'content', seo.canonicalUrl);
@@ -169,6 +170,16 @@ export default function App() {
       document.head.appendChild(canonicalEl);
     }
     canonicalEl.setAttribute('href', seo.canonicalUrl);
+
+    // Sync JSON-LD structured data (WebSite, WebApplication, FAQPage) for active view
+    document.querySelectorAll('script[type="application/ld+json"]').forEach((el) => el.remove());
+    for (const schema of seo.structuredData) {
+      const script = document.createElement('script');
+      script.type = 'application/ld+json';
+      script.setAttribute('data-qmm-seo', 'true');
+      script.textContent = JSON.stringify(schema);
+      document.head.appendChild(script);
+    }
 
     if (window.location.pathname !== seo.canonicalPath || window.location.search) {
       window.history.replaceState({}, '', seo.canonicalPath);

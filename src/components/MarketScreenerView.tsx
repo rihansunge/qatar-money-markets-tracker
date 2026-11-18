@@ -4,6 +4,7 @@ import type { QseSecurity, Sector, Timeframe } from '../types/market';
 import { formatQarPrice, getDayChange } from '../utils/marketMath';
 import { useLiveHistory } from '../utils/useLiveHistory';
 import { HistoricalChart } from './HistoricalChart';
+import { SeoFaqSection } from './SeoFaqSection';
 import { Sparkline } from './Sparkline';
 
 interface MarketScreenerViewProps {
@@ -484,6 +485,14 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
           </div>
         )}
       </div>
+
+      <SeoFaqSection
+        section="market"
+        ticker={activeSecurity.ticker}
+        priceQar={activeSecurity.price}
+        dividendYieldPct={activeSecurity.dividendYieldPct}
+        heading={`${activeSecurity.ticker} (${activeSecurity.name}) FAQ & Search Topics (EN / العربية)`}
+      />
     </div>
   );
 };

@@ -13,6 +13,7 @@ import type {
 import { getDayChange, formatQarPrice } from '../utils/marketMath';
 import { useLiveHistory } from '../utils/useLiveHistory';
 import { HistoricalChart } from './HistoricalChart';
+import { SeoFaqSection } from './SeoFaqSection';
 
 interface OverviewViewProps {
   indices: MarketIndex[];
@@ -600,6 +601,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           </div>
         </div>
       </div>
+
+      <SeoFaqSection
+        section="overview"
+        heading="Qatar Stock Exchange & Markets FAQ (EN / العربية)"
+      />
     </div>
   );
 };
